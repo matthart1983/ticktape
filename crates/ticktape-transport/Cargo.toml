@@ -1,0 +1,17 @@
+[package]
+name = "ticktape-transport"
+description = "Reliable sequenced-stream transport for Ticktape: MoldUDP64-style A/B UDP feeds, gap-fill retransmission, and in-order reassembly"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ticktape-core.workspace = true
+
+[dev-dependencies]
+ticktape-sim.workspace = true
+ticktape-runtime.workspace = true
+ticktape-journal.workspace = true
+tempfile = "3"

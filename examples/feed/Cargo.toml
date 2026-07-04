@@ -1,0 +1,12 @@
+[package]
+name = "feed"
+description = "Ticktape multi-process demo: a leader publishes its sequenced stream over UDP A/B feeds; followers replicate bit-identical state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ticktape.workspace = true
+ticktape-sim.workspace = true
+ticktape-transport.workspace = true

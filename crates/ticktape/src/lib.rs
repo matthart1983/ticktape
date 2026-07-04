@@ -52,5 +52,8 @@ pub use ticktape_core::{
 pub use ticktape_codec::{Decode, Encode};
 pub use ticktape_journal::{FsyncPolicy, Journal, JournalConfig, JournalError, Recovered};
 pub use ticktape_runtime::{
-    InProcBus, ManualClock, Node, NodeConfig, NodeError, TimeSource, WallClock,
+    InProcBus, ManualClock, Node, NodeConfig, NodeError, RecoveryInfo, TimeSource, WallClock,
+};
+pub use ticktape_transport::{
+    Publisher, PublisherConfig, Receiver, ReceiverConfig, Replica, TransportError,
 };

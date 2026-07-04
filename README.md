@@ -12,8 +12,10 @@ You write a `Service`: a pure `(state, input) → outputs` step function.
 ticktape provides total ordering, durable journaling, replay recovery, and a
 seeded fault-injecting simulator that hammers *your* state machine with
 crashes and torn writes while checking durability, ordering, determinism,
-and your own invariants. Networking, replication, and failover land next on
-the roadmap — on the same `Service` trait, unchanged.
+and your own invariants. A reliable sequenced UDP transport (A/B feeds +
+gap-fill) streams the total order to follower replicas that compute
+bit-identical state; replication tiers and failover land next on the
+roadmap — on the same `Service` trait, unchanged.
 
 ```rust
 use ticktape::{Ctx, Decode, Encode, Node, NodeConfig, Seq, Service};
@@ -155,6 +157,20 @@ $ cargo run -p orderbook -- verify
 invariants: OK · replay equivalence: OK
 ```
 
+And the **multi-process demo**: a leader publishes its sequenced stream
+over UDP; followers in other processes replicate bit-identical state live,
+gap-filling anything lost from the retransmitter:
+
+```text
+# terminal 1
+$ cargo run -p feed -- sub --bind 127.0.0.1:7101 --retx 127.0.0.1:7110
+follower: seq 100 · balances [2145, 2418, ...] · invariants OK
+
+# terminal 2
+$ cargo run -p feed -- pub --to 127.0.0.1:7101 --retx-port 7110
+leader: seq 100
+```
+
 ## Deterministic simulation testing
 
 The reason to build on a framework like this is trusting it under failure —
@@ -237,7 +253,8 @@ CI runs 2000 fresh seeds on every push.
 | `ticktape-journal` | Segmented append-only log: per-frame CRCs, fsync policy (per-frame / time-window group commit / never), torn-tail detection + truncation, gapless-seq validation. Plus the CRC-checked snapshot store (stale snapshots purged on recovery). All I/O behind a `Storage` trait. |
 | `ticktape-runtime` | Single-node `Node`: sequence → journal → apply, crash recovery from `snapshot + replay(tail)` with fallback to full replay, cadence snapshotting + `SnapshotMark` frames, sequenced tick time, monotonic-clamped timestamps, in-proc stream fan-out, `verify_replay()`. |
 | `ticktape-sim` | The deterministic simulator: seeded RNG (SplitMix64, no `rand` dependency — archived seeds must never rot), simulated disk with crash semantics, virtual clock, `Invariants`, the VOPR loop, and the `vopr` binary. |
-| `examples/counter`, `examples/kv`, `examples/orderbook` | The hello world; the smallest real service; and the flagship price-time-priority CLOB — all with crash-recovery tests, `kv` and `orderbook` fuzzed by the simulator in `cargo test`. |
+| `ticktape-transport` | Reliable sequenced-stream transport, MoldUDP64/SoupBinTCP-shaped: A/B UDP feed redundancy, heartbeat high-water marks, gap detection by seq, unicast TCP range retransmission, late-join catch-up, and `Replica` — a follower that recomputes the service from the ordered stream. The reliability core (`Reassembler`) is a pure state machine, fuzzed across 200 seeds of loss/duplication/reordering. |
+| `examples/counter`, `examples/kv`, `examples/orderbook`, `examples/feed` | The hello world; the smallest real service; the flagship price-time-priority CLOB; and the multi-process leader/follower feed demo. `kv` and `orderbook` are fuzzed by the simulator in `cargo test`. |
 
 ## How determinism is enforced (not hoped for)
 
@@ -289,19 +306,20 @@ schema evolution never touches framework wire stability.
 
 ## Status & roadmap
 
-**Today (M0–M2):** a usable, durable, deterministic-service library with
-snapshot-accelerated recovery and a fused simulation-testing harness —
-single node, single process. **Not yet:** replication, failover,
-cross-process transport, gateways, journal compaction, benchmarks. The API
-will move.
+**Today (M0–M3):** a usable, durable, deterministic-service library with
+snapshot-accelerated recovery, a fused simulation-testing harness, and a
+reliable sequenced transport feeding cross-process follower replicas.
+**Not yet:** leader election/failover (followers exist; promotion doesn't),
+quorum commit, gateways, journal compaction, a shared-memory IPC ring,
+benchmarks. The API will move.
 
 | Milestone | Scope | Status |
 |---|---|---|
 | M0 — Core + single node | `Service`/`Ctx`, codec + derives, segmented journal, replay recovery | ✅ |
 | M1 — Determinism harness | `ticktape-sim`: seeded storage faults, invariant checks, VOPR loop + shrinking | ✅ |
 | M2 — Snapshotting + flagship example | Snapshot store, `SnapshotMark`, fast recovery; the order book with no-crossed-book / share-conservation invariants under simulation | ✅ |
-| M3 — Transport | Shared-memory IPC ring; reliable sequenced UDP multicast (MoldUDP64-style A/B feeds) + retransmitter/gap-fill | next |
-| M4 — Replication + failover | Async hot standby with epoch lease/fencing (the classic exchange mode); quorum-committed tier (VSR-shaped); leader kills and partitions in the simulator | |
+| M3 — Transport | Reliable sequenced UDP (MoldUDP64-style A/B feeds), TCP gap-fill retransmitter, follower `Replica`; shm IPC ring deferred to the perf pass | ✅ |
+| M4 — Replication + failover | Async hot standby with epoch lease/fencing (the classic exchange mode); quorum-committed tier (VSR-shaped); leader kills and partitions in the simulator | next |
 | M5 — Gateways | Client sessions: dedup, flow control, cancel-on-disconnect, drop-copy | |
 | M6 — Hardening | Performance benchmarks in CI, `io_uring` path, docs | |
 
@@ -354,8 +372,12 @@ Brian Nigito's [How to Build an Exchange](https://www.youtube.com/watch?v=b1e4t2
 - **Recovery still reads (and CRC-verifies) the full journal**; snapshots
   skip re-*applying* old inputs, and segment skip-scan/compaction lands with
   journal compaction.
+- **The transport's socket layer is thin by design** — one frame per packet
+  (batching is a planned optimization), blocking gap-fill, and Unix
+  datagram sockets instead of the planned shared-memory ring for same-box
+  IPC. The reliability *logic* is the fuzzed part.
 - The simulator does not yet model directory-entry loss on crash, reordered
-  (non-prefix) page flushes, or multi-node faults (those arrive with M3/M4).
+  (non-prefix) page flushes, or multi-node faults (those arrive with M4).
 
 ## License
 
