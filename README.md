@@ -344,23 +344,25 @@ acceptor-crash faults in the simulator. The API will still move.
 
 The spec sets design budgets; `cargo run --release -p ticktape-bench`
 measures against them (CI runs it report-only — runner hardware is too
-noisy to gate). Numbers below from an Apple-silicon laptop:
+noisy to gate). Apple-silicon laptop / Linux CI runner:
 
-| Path | Measured | Budget | |
+| Path | Measured (macOS / Linux) | Budget | |
 |---|---|---|---|
-| `apply` step (Bank service) | 24 ns/op | < 200 ns | ✅ |
-| submit, `fsync=never` | p50 1.1 µs · p99 3.0 µs | p50 < 1 µs · p99 < 5 µs | ~ |
-| submit, group-commit / per-frame fsync | p50 ≈ 4 ms (macOS barrier-fsync) | p99 < 15 µs (NVMe) | ❌ see below |
-| cold recovery (read + replay) | 12.4 M frames/s (1 M in 0.08 s) | < 1 s / day of data | ✅ |
-| reassembler (transport core) | 28 M frames/s | supports < 2 µs fan-out | ✅ |
-| simulator speed | ~45,000× wall-clock | ≥ 1000× | ✅ |
+| `apply` step (Bank service) | 24 / 21 ns/op | < 200 ns | ✅ |
+| submit, `fsync=never` | p50 1.1 µs / **535 ns** · p99 3.0 / 1.8 µs | p50 < 1 µs · p99 < 5 µs | ✅ on Linux |
+| submit, group-commit 50 µs | p50 ≈ 4 ms / **1.0 µs** · p99 — / 278 µs | p50 < 1 µs · p99 < 5 µs | p50 ✅ on Linux |
+| submit, fsync every frame | p50 ≈ 4 ms / 200 µs | p99 < 15 µs (NVMe) | ❌ see below |
+| cold recovery (read + replay) | 12.4 / 7.6 M frames/s | < 1 s / day of data | ✅ |
+| reassembler (transport core) | 28 / 21.5 M frames/s | supports < 2 µs fan-out | ✅ |
+| simulator speed | ~45,000× / ~25,000× wall-clock | ≥ 1000× | ✅ |
 
-The fsync rows are the honest gap, and they're architectural, not
+The synced fsync tails are the honest gap, and they're architectural, not
 mysterious: a synchronous single-caller `submit` pays the full fsync
-whenever a window closes, so time-window group commit degenerates to
-fsync-per-frame — and macOS barrier-fsync costs milliseconds. Hitting the
-sub-15 µs budget requires the real exchange design: batched group commit
-across *concurrent* ingress with deferred acks, on NVMe with
+whenever a window closes, so time-window group commit degenerates toward
+fsync-per-frame under serial load — milliseconds on macOS barrier-fsync,
+hundreds of µs on the CI runner's disk. Hitting the sub-15 µs synced
+budget requires the real exchange design: batched group commit across
+*concurrent* ingress with deferred acks, on NVMe with
 `io_uring`/`O_DIRECT`. That pipeline (with packet batching on the
 transport, which the same single-frame-per-packet simplification caps at
 ~0.8 M frames/s vs the 2–3 M/s budget) is the named performance workstream
