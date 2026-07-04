@@ -20,7 +20,14 @@ the gap on reconnect; drop-copy can join from any point. Covered by an e2e
 test that kills a client, trades against its book, reconnects, and sees
 the missed fills.
 
-### 2. Unbounded growth in three stores
+### 2. Unbounded growth in three stores — i.e. no 24×7/365 operation yet
+Practitioner framing (from a review of core-derived production platforms):
+this is exactly the property that disqualifies jimgreco/core for continuous
+operation — "no snapshot service and it doesn't prune the journal" — and
+the property Aeron Cluster is prized for (snapshots + journal pruning so
+disk never fills). ticktape already has the snapshot half (M2, with
+corrupt-fallback and stale-purge); the pruning half below is what turns
+"runs for a session" into "runs forever".
 - `transport::MemStore` (retransmit) never evicts — a long-running feed
   leaks its entire history in memory. Fix: split the retransmitter the
   way jimgreco/core splits `MoldRepeater`/`MoldRewinder` — a **repeater**
@@ -38,7 +45,8 @@ the missed fills.
 
 **Done means:** a week-long soak of the feed example holds steady RSS and
 disk bounded by config; recovery time is bounded by snapshot cadence, not
-journal age.
+journal age — i.e. **continuous 24×7/365 operation with no restart or
+day-roll required**.
 
 ### 3. Gateway flow control cannot actually throttle
 `SessionFlow` windows are correct and unit-tested, but the live server
@@ -85,6 +93,15 @@ Missing pieces, in dependency order:
   forced), adopt the feed publisher role, emit `EpochChange`, gateway
   fail-over of client connections.
 
+**No single point of failure, stated explicitly:** in this architecture a
+"replicated journal" is not a separate subsystem — every replica journals
+the stream it applies, and Tier 2 commits only what a majority has durably
+journaled, so journal redundancy falls out of deterministic replay. The
+packaged server should make the *auxiliary* services redundant the same
+way: any replica can serve repeater/rewinder gap-fill from its own
+journal, and snapshots are taken on replicas (spec §12), so no component
+of a deployment is unique.
+
 **Done means (Stage A):** operator-promoted failover of a 3-node exchange
 deployment with no committed loss (Tier 2) and clients resuming sessions.
 **Done means (Stage B):** `kill -9` the leader; a standby promotes within
@@ -125,6 +142,11 @@ monitoring tooling). Minimal version: a stats struct per component
 (sequencer seq + commit watermark, journal bytes + segment count, snapshot
 age, session count + per-session seqs, retransmit window depth, gap-fill
 counts) surfaced by the packaged server on one plain-text/HTTP endpoint.
+Practitioner precedent goes further — core lets you telnet into any node
+for an interactive shell (inspect state, submit admin commands, JMX-style)
+plus a web console. Stats endpoint first; an interactive admin channel
+(pause/promote/snapshot-now/prune) is the natural second step and shares
+plumbing with Stage-A manual promotion.
 **Done means:** an operator can answer "is it healthy, how far behind is
 the standby, when was the last snapshot" with curl, no debugger.
 
@@ -165,6 +187,17 @@ throughput budget vs 0.8–1.7 M/s.
   the journal").
 - `openraft` delegation backend behind a `raft-backend` feature (spec §9
   open question — build only if someone actually wants it).
+- **SBE codec adapter** (spec §6 tier 3) — practitioner platforms in this
+  space serialize with SBE; an adapter makes ticktape services interoperable
+  with that ecosystem without abandoning the canonical `fixed` tier.
+- **Transport is deliberately swappable** — practitioner consensus is that
+  the sequencer needs only plain UDP multicast or TCP (Aeron is "just
+  reliable A→B transport"), which is what M3 built. Keep `PacketSource`/
+  publisher seams clean so an Aeron-backed (or QUIC-backed) transport could
+  slot in for users who want it; owning the *journal*, by contrast, stays a
+  non-negotiable — an outsourced archive (Aeron Archiver) cannot be
+  fault-injected deterministically inside the simulator, and DST is the
+  moat.
 - **`WIRE.md`** — a standalone wire-format spec (frame, segment, snapshot,
   packet, retransmit-request layouts + CRC rules, currently documented
   only in Rust doc-comments). The wire is already language-neutral;
