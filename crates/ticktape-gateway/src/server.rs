@@ -121,6 +121,12 @@ fn sequencer_loop<S, C, E, T, St>(
                     .cmd = Some(sink);
             }
             Req::Watch { session, sink } => {
+                // Registration is acked (client_seq 0) so observers know
+                // they are live before events they must not miss occur.
+                let _ = sink.send(encode_msg::<E>(&ServerMsg::Ack {
+                    client_seq: 0,
+                    seq: 0,
+                }));
                 sinks
                     .entry(session)
                     .or_insert_with(|| SessionSinks {

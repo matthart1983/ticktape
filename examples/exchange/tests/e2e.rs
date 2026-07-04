@@ -220,6 +220,12 @@ fn disconnect_pulls_resting_orders_and_drop_copy_sees_it_all() {
     )
     .unwrap();
     let mut watcher = BufReader::new(watcher_stream);
+    // Wait for the registration ack: nothing observable may happen before
+    // the watcher is provably live (otherwise this test races its setup).
+    assert!(matches!(
+        read_msg::<ServerMsg<Evt>>(&mut watcher).unwrap(),
+        Some(ServerMsg::Ack { client_seq: 0, .. })
+    ));
 
     // Session 3 rests an order, then vanishes (connection drop).
     let mut trader = Client::connect(addr, 3);
