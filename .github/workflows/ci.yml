@@ -37,3 +37,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Fuzz 2000 seeds
         run: cargo run --release -p ticktape-sim --bin vopr -- --seed ${{ github.run_number }} --runs 2000
+
+  bench:
+    name: bench (report-only, spec §14 budgets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Report-only: runner hardware is noisy and shared, so numbers are
+      # printed for the log (and step summary), not gated. Completing at
+      # all still catches gross regressions (hangs, panics, O(n²) blowups).
+      - name: Run benches
+        run: |
+          cargo run --release -p ticktape-bench | tee bench.txt
+          { echo '```'; cat bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

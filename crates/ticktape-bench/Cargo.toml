@@ -1,0 +1,21 @@
+[package]
+name = "ticktape-bench"
+description = "Benchmarks for Ticktape against the spec's performance budgets (budgets, not SLAs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+ticktape-core.workspace = true
+ticktape-journal.workspace = true
+ticktape-runtime.workspace = true
+ticktape-sim.workspace = true
+ticktape-transport.workspace = true
+tempfile = "3"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"

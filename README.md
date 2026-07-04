@@ -317,16 +317,18 @@ schema evolution never touches framework wire stability.
 
 ## Status & roadmap
 
-**Today (M0–M5):** a usable, durable, deterministic-service library with
+**Today (M0–M6):** a usable, durable, deterministic-service library with
 snapshot-accelerated recovery, a fused simulation-testing harness, a
 reliable sequenced transport feeding cross-process follower replicas,
 simulation-verified failover machinery (elections, fencing, quorum
-commit), and a TCP gateway with sessions, dedup, flow control,
-cancel-on-disconnect, and drop-copy. **Not yet:** a packaged
-clustered-server binary wiring cluster + transport + gateway to live
-timers end-to-end, journal compaction, a shared-memory IPC ring, the
-`openraft` delegation backend, acceptor-crash faults in the simulator,
-benchmarks (M6). The API will move.
+commit), a TCP gateway with sessions, dedup, flow control,
+cancel-on-disconnect, and drop-copy, and benchmarks in CI against the
+spec's budgets. **The spine of the spec is walked.** Still open, and named
+rather than hidden: the async group-commit/`io_uring` performance
+workstream (see Performance), a packaged clustered-server binary wiring
+cluster + transport + gateway to live timers end-to-end, journal
+compaction, the shared-memory IPC ring, the `openraft` delegation backend,
+acceptor-crash faults in the simulator. The API will still move.
 
 | Milestone | Scope | Status |
 |---|---|---|
@@ -336,10 +338,34 @@ benchmarks (M6). The API will move.
 | M3 — Transport | Reliable sequenced UDP (MoldUDP64-style A/B feeds), TCP gap-fill retransmitter, follower `Replica`; shm IPC ring deferred to the perf pass | ✅ |
 | M4 — Replication + failover | Epoch-lease elections + fencing (Tier 1, the classic exchange mode) and VSR-shaped quorum commit (Tier 2); leader kills, partitions, and dueling candidates in the simulator | ✅ |
 | M5 — Gateways | Client sessions: dedup, flow control, cancel-on-disconnect, drop-copy; external clients drive the order book end-to-end over TCP | ✅ |
-| M6 — Hardening | Performance benchmarks in CI, `io_uring` path, the packaged clustered-server binary, docs | next |
+| M6 — Hardening | Benchmarks in CI against the spec budgets; compute paths beat budget, fsync paths measured honestly (async group-commit + `io_uring` named as the follow-on perf workstream) | ✅ |
 
-Performance numbers are deliberately absent until M6 measures them —
-budgets, not marketing.
+## Performance
+
+The spec sets design budgets; `cargo run --release -p ticktape-bench`
+measures against them (CI runs it report-only — runner hardware is too
+noisy to gate). Numbers below from an Apple-silicon laptop:
+
+| Path | Measured | Budget | |
+|---|---|---|---|
+| `apply` step (Bank service) | 24 ns/op | < 200 ns | ✅ |
+| submit, `fsync=never` | p50 1.1 µs · p99 3.0 µs | p50 < 1 µs · p99 < 5 µs | ~ |
+| submit, group-commit / per-frame fsync | p50 ≈ 4 ms (macOS barrier-fsync) | p99 < 15 µs (NVMe) | ❌ see below |
+| cold recovery (read + replay) | 12.4 M frames/s (1 M in 0.08 s) | < 1 s / day of data | ✅ |
+| reassembler (transport core) | 28 M frames/s | supports < 2 µs fan-out | ✅ |
+| simulator speed | ~45,000× wall-clock | ≥ 1000× | ✅ |
+
+The fsync rows are the honest gap, and they're architectural, not
+mysterious: a synchronous single-caller `submit` pays the full fsync
+whenever a window closes, so time-window group commit degenerates to
+fsync-per-frame — and macOS barrier-fsync costs milliseconds. Hitting the
+sub-15 µs budget requires the real exchange design: batched group commit
+across *concurrent* ingress with deferred acks, on NVMe with
+`io_uring`/`O_DIRECT`. That pipeline (with packet batching on the
+transport, which the same single-frame-per-packet simplification caps at
+~0.8 M frames/s vs the 2–3 M/s budget) is the named performance workstream
+— until it lands, run `fsync=never` + Tier 1/2 replication for durability,
+which is the historical exchange configuration anyway.
 
 ## Relation to prior art
 
