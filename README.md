@@ -323,12 +323,13 @@ reliable sequenced transport feeding cross-process follower replicas,
 simulation-verified failover machinery (elections, fencing, quorum
 commit), a TCP gateway with sessions, dedup, flow control,
 cancel-on-disconnect, and drop-copy, and benchmarks in CI against the
-spec's budgets. **The spine of the spec is walked.** Still open, and named
-rather than hidden: the async group-commit/`io_uring` performance
-workstream (see Performance), a packaged clustered-server binary wiring
-cluster + transport + gateway to live timers end-to-end, journal
-compaction, the shared-memory IPC ring, the `openraft` delegation backend,
-acceptor-crash faults in the simulator. The API will still move.
+spec's budgets. **The spine of the spec is walked.** What is *not* done is
+audited honestly in [BACKLOG.md](BACKLOG.md) — highlights: events to
+offline sessions are dropped (no session-stream replay yet), three stores
+grow unbounded (retransmit history, old snapshots, journal segments), the
+failover machinery is simulation-proven but not yet packaged as an
+auto-failing-over server, and the async group-commit/`io_uring`
+performance workstream (see Performance). The API will still move.
 
 | Milestone | Scope | Status |
 |---|---|---|
