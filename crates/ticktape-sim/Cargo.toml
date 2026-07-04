@@ -1,0 +1,18 @@
+[package]
+name = "ticktape-sim"
+description = "Deterministic simulation testing for Ticktape services: seeded storage fault injection, invariant checking, and a VOPR-style fuzz loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ticktape-core.workspace = true
+ticktape-codec.workspace = true
+ticktape-journal.workspace = true
+ticktape-runtime.workspace = true
+
+[[bin]]
+name = "vopr"
+path = "src/bin/vopr.rs"

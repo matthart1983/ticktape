@@ -1,0 +1,11 @@
+[package]
+name = "counter"
+description = "Ticktape hello world: a deterministic counter service with journal-backed crash recovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ticktape.workspace = true
+ticktape-core.workspace = true

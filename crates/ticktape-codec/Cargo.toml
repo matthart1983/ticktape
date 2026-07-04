@@ -1,0 +1,12 @@
+[package]
+name = "ticktape-codec"
+description = "Canonical fixed-layout codec for Ticktape: Encode/Decode traits, primitive impls, and derive macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ticktape-core.workspace = true
+ticktape-macros.workspace = true

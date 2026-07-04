@@ -1,0 +1,15 @@
+[package]
+name = "kv"
+description = "Ticktape example: a durable, deterministic key-value store rebuilt by journal replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ticktape.workspace = true
+ticktape-core.workspace = true
+ticktape-sim.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

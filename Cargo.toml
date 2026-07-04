@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ticktape-core",
+    "crates/ticktape-codec",
+    "crates/ticktape-macros",
+    "crates/ticktape-journal",
+    "crates/ticktape-runtime",
+    "crates/ticktape-sim",
+    "crates/ticktape",
+    "examples/counter",
+    "examples/kv",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/matthart1983/ticktape"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ticktape-core = { path = "crates/ticktape-core" }
+ticktape-codec = { path = "crates/ticktape-codec" }
+ticktape-macros = { path = "crates/ticktape-macros" }
+ticktape-journal = { path = "crates/ticktape-journal" }
+ticktape-runtime = { path = "crates/ticktape-runtime" }
+ticktape-sim = { path = "crates/ticktape-sim" }
+ticktape = { path = "crates/ticktape" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

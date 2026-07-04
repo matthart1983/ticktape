@@ -1,0 +1,14 @@
+[package]
+name = "ticktape-journal"
+description = "Segmented append-only journal for Ticktape: durable sequenced-input log with fsync policy and replay recovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ticktape-core.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

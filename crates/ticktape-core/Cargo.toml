@@ -1,0 +1,10 @@
+[package]
+name = "ticktape-core"
+description = "Core types for the Ticktape sequencer-architecture framework: Frame, Seq, Service trait, deterministic clock, canonical codec traits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]

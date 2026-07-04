@@ -1,0 +1,16 @@
+[package]
+name = "ticktape-runtime"
+description = "Single-node Ticktape runtime: sequencer + deterministic service host with journal-backed crash recovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ticktape-core.workspace = true
+ticktape-journal.workspace = true
+
+[dev-dependencies]
+ticktape-codec.workspace = true
+tempfile = "3"

@@ -1,0 +1,14 @@
+[package]
+name = "ticktape"
+description = "A framework for deterministic, replicated services on the sequencer architecture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ticktape-core.workspace = true
+ticktape-codec.workspace = true
+ticktape-journal.workspace = true
+ticktape-runtime.workspace = true
