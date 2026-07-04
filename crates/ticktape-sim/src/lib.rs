@@ -101,6 +101,10 @@ pub struct SimConfig {
     pub segment_bytes: u64,
     /// Whether surviving crash tails may take a bit flip (torn sector).
     pub torn_tails: bool,
+    /// Node snapshot cadence. `Some(n)` exercises the snapshot/restore
+    /// recovery path (and snapshot files take crash faults like any other
+    /// file); `None` forces full replay from genesis.
+    pub snapshot_every: Option<u64>,
 }
 
 impl SimConfig {
@@ -113,6 +117,7 @@ impl SimConfig {
             tick_per_mille: 80,
             segment_bytes: 512,
             torn_tails: true,
+            snapshot_every: Some(20),
         }
     }
 }
@@ -150,6 +155,9 @@ impl fmt::Display for SimFailure {
 enum Expected {
     Input(Vec<u8>),
     Tick,
+    /// A framework-generated `SnapshotMark` (the node appends one right
+    /// after a frame that hits the snapshot cadence).
+    Mark,
 }
 
 /// Run one seeded simulation of `S` under storage faults.
@@ -176,6 +184,7 @@ where
         // Durability is driven explicitly by the sim's `sync` op, so lost
         // unsynced tails are actually possible.
         nc.journal.fsync = FsyncPolicy::Never;
+        nc.snapshot_every = config.snapshot_every;
         nc
     };
 
@@ -227,16 +236,20 @@ where
             synced = expected.len();
         } else if dice < config.crash_per_mille + config.sync_per_mille + config.tick_per_mille {
             stats.ticks += 1;
+            let before = node.seq();
             node.tick()
                 .map_err(|e| fail(step, InvariantViolation::new(format!("tick failed: {e}"))))?;
             expected.push(Expected::Tick);
+            push_marks(&mut expected, before, node.seq());
         } else {
             stats.inputs += 1;
             let input = gen_input(&mut rng);
             let bytes = encode_to_vec(&input);
+            let before = node.seq();
             node.submit(input)
                 .map_err(|e| fail(step, InvariantViolation::new(format!("submit failed: {e}"))))?;
             expected.push(Expected::Input(bytes));
+            push_marks(&mut expected, before, node.seq());
             node.service().check().map_err(|v| fail(step, v))?;
         }
     }
@@ -257,6 +270,14 @@ where
     )?;
 
     Ok(stats)
+}
+
+/// One op should consume one seq; any extra seqs the node consumed are
+/// framework-appended `SnapshotMark` frames.
+fn push_marks(expected: &mut Vec<Expected>, before: Seq, after: Seq) {
+    for _ in 1..(after.0 - before.0) {
+        expected.push(Expected::Mark);
+    }
 }
 
 /// Reopen the node after a crash and run the full invariant checklist.
@@ -340,6 +361,7 @@ where
         let matches = match &expected[i] {
             Expected::Input(bytes) => frame.kind == FrameKind::Input && &frame.payload == bytes,
             Expected::Tick => frame.kind == FrameKind::Tick,
+            Expected::Mark => frame.kind == FrameKind::SnapshotMark,
         };
         if !matches {
             return Err(fail(InvariantViolation::new(format!(

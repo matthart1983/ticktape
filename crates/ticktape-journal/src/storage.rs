@@ -38,6 +38,8 @@ pub trait Storage {
     /// Truncate a file to `len` and durably persist the new length
     /// (set_len + fsync semantics). Used to discard a torn tail.
     fn truncate(&self, path: &Path, len: u64) -> io::Result<()>;
+    /// Remove a file (used to purge stale snapshots on recovery).
+    fn remove(&self, path: &Path) -> io::Result<()>;
     /// Durably persist directory entries (fsync-the-directory semantics)
     /// after creating a file. Platforms without this are a no-op.
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
@@ -92,6 +94,10 @@ impl Storage for RealStorage {
         let file = OpenOptions::new().write(true).open(path)?;
         file.set_len(len)?;
         file.sync_all()
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
     }
 
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {

@@ -1,0 +1,15 @@
+[package]
+name = "orderbook"
+description = "Ticktape flagship example: a durable, deterministic price-time-priority limit order book"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ticktape.workspace = true
+ticktape-core.workspace = true
+ticktape-sim.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

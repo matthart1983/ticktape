@@ -26,8 +26,10 @@
 //! `O_DIRECT`/`io_uring` I/O. Group commit is time-window based via
 //! [`FsyncPolicy::Micros`].
 
+pub mod snapshot;
 pub mod storage;
 
+pub use snapshot::{LoadedSnapshot, SnapshotStore};
 pub use storage::{RealStorage, Storage, StorageFile};
 
 use std::fmt;

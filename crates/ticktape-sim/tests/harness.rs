@@ -223,3 +223,62 @@ fn bit_rot_in_synced_data_is_never_silently_wrong() {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// Bug class 4: snapshot/restore asymmetry. `restore` mis-rebuilds state
+// (off-by-one), so a recovery that goes through a snapshot diverges from a
+// full replay of the same inputs. Only exercised when snapshots are on —
+// this is the check the M2 snapshot path adds.
+
+struct OffByOneRestore {
+    total: i64,
+}
+
+impl Service for OffByOneRestore {
+    type Input = Poke;
+    type Output = ();
+    type Snapshot = i64;
+    type Config = ();
+
+    fn genesis(_: &()) -> Self {
+        OffByOneRestore { total: 0 }
+    }
+
+    fn apply(&mut self, _seq: Seq, input: &Poke, _ctx: &mut Ctx<'_, ()>) {
+        self.total += input.0 as i64;
+    }
+
+    fn snapshot(&self) -> i64 {
+        self.total
+    }
+
+    fn restore(total: i64, _: &()) -> Self {
+        // The bug.
+        OffByOneRestore { total: total + 1 }
+    }
+}
+
+impl Invariants for OffByOneRestore {
+    fn check(&self) -> Result<(), InvariantViolation> {
+        Ok(())
+    }
+}
+
+#[test]
+fn catches_broken_restore_via_snapshot_recovery() {
+    let mut config = SimConfig::new(2);
+    config.steps = 400;
+    config.snapshot_every = Some(10); // recover via snapshots often
+    let failure =
+        simulate::<OffByOneRestore>(&config, (), |rng: &mut Rng| Poke(rng.below(256) as u8))
+            .expect_err("harness must catch the restore bug");
+    assert!(
+        failure.violation.what.contains("determinism violated"),
+        "wrong violation: {failure}"
+    );
+
+    // Same service with snapshots disabled never touches restore: clean.
+    config.snapshot_every = None;
+    simulate::<OffByOneRestore>(&config, (), |rng: &mut Rng| Poke(rng.below(256) as u8))
+        .expect("full-replay recovery does not exercise the bug");
+}

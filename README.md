@@ -135,6 +135,26 @@ $ cargo run -p kv -- verify        # replay-equivalence self-check
 replay equivalence: OK
 ```
 
+The flagship example is a **price-time-priority limit order book** —
+journaled, snapshotted, and fuzzed under fault injection with
+exchange-grade invariants (never a crossed book; every accepted share is
+exactly one of traded, canceled, or resting):
+
+```text
+$ cargo run -p orderbook -- sell 100 102
+$ cargo run -p orderbook -- sell 50 101
+$ cargo run -p orderbook -- buy 120 102
+seq 3 (order id 3):
+  Accepted { id: 3 }
+  Trade { taker: 3, maker: 2, price: 101, qty: 50 }   # best price first,
+  Trade { taker: 3, maker: 1, price: 102, qty: 70 }   # at the maker's price
+$ cargo run -p orderbook -- book
+  BID qty@px | ASK qty@px
+             | 30@102
+$ cargo run -p orderbook -- verify
+invariants: OK · replay equivalence: OK
+```
+
 ## Deterministic simulation testing
 
 The reason to build on a framework like this is trusting it under failure —
@@ -156,7 +176,10 @@ After every crash + recovery, the harness checks:
 3. **Total order** — surviving frames are a byte-exact, gapless prefix of
    what was submitted.
 4. **Determinism** — recovered state byte-matches an independent
-   `genesis + replay` of the surviving frames.
+   `genesis + replay` of the surviving frames. With snapshots enabled the
+   node recovers via `restore(snapshot) + replay(tail)`, so this check also
+   proves your `restore` is exact — and snapshot files take crash faults
+   like any other file (torn snapshots must fall back, never lie).
 5. **Your invariants** — whatever must always hold about *your* state.
 
 Wiring a service in is one trait and one closure:
@@ -186,9 +209,15 @@ seed 217 failed at step 143: negative balance: -58 (reproduce with seed=217 step
 The harness's own acceptance tests prove it catches real bug classes: a
 service that reads a process-global inside `apply` (ambient state → replay
 divergence), a bank that allows overdrafts (invariant violation, shrunk and
-reproduced), and bit rot injected into synced journal bytes (must always be
-a loud error or a validated truncation — never silently wrong state). There
-is also a standalone fuzzer:
+reproduced), an off-by-one `restore` (caught only when recovery goes
+through a snapshot — and provably clean with snapshots off), and bit rot
+injected into synced journal bytes (must always be a loud error or a
+validated truncation — never silently wrong state). It catches real bugs,
+not just planted ones: seed 0 of the snapshot milestone's first fuzz run
+found a stale-snapshot-poisoning bug (a snapshot outliving a journal
+truncation described a history that no longer existed), which is why
+recovery now purges snapshots past the surviving tail. There is also a
+standalone fuzzer:
 
 ```sh
 cargo run --release -p ticktape-sim --bin vopr                  # fuzz forever
@@ -205,10 +234,10 @@ CI runs 2000 fresh seeds on every push.
 | `ticktape` | Facade re-exporting the common surface. Start here. |
 | `ticktape-core` | `Frame` (CRC32C-checked wire/journal record), `Seq`, sequenced `Timestamp`, the `Service`/`Ctx` contract, canonical `Encode`/`Decode` traits. Dependency-free. |
 | `ticktape-codec` + `ticktape-macros` | The "fixed" codec: `#[derive(Encode, Decode)]` producing little-endian, declaration-order, canonical bytes. |
-| `ticktape-journal` | Segmented append-only log: per-frame CRCs, fsync policy (per-frame / time-window group commit / never), torn-tail detection + truncation, gapless-seq validation. All I/O behind a `Storage` trait. |
-| `ticktape-runtime` | Single-node `Node`: sequence → journal → apply, crash recovery by replay, sequenced tick time, monotonic-clamped timestamps, in-proc stream fan-out, `verify_replay()`. |
+| `ticktape-journal` | Segmented append-only log: per-frame CRCs, fsync policy (per-frame / time-window group commit / never), torn-tail detection + truncation, gapless-seq validation. Plus the CRC-checked snapshot store (stale snapshots purged on recovery). All I/O behind a `Storage` trait. |
+| `ticktape-runtime` | Single-node `Node`: sequence → journal → apply, crash recovery from `snapshot + replay(tail)` with fallback to full replay, cadence snapshotting + `SnapshotMark` frames, sequenced tick time, monotonic-clamped timestamps, in-proc stream fan-out, `verify_replay()`. |
 | `ticktape-sim` | The deterministic simulator: seeded RNG (SplitMix64, no `rand` dependency — archived seeds must never rot), simulated disk with crash semantics, virtual clock, `Invariants`, the VOPR loop, and the `vopr` binary. |
-| `examples/counter`, `examples/kv` | The hello world and the smallest real service, both with crash-recovery tests; `kv` is fuzzed by the simulator in `cargo test`. |
+| `examples/counter`, `examples/kv`, `examples/orderbook` | The hello world; the smallest real service; and the flagship price-time-priority CLOB — all with crash-recovery tests, `kv` and `orderbook` fuzzed by the simulator in `cargo test`. |
 
 ## How determinism is enforced (not hoped for)
 
@@ -260,17 +289,18 @@ schema evolution never touches framework wire stability.
 
 ## Status & roadmap
 
-**Today (M0 + M1):** a usable, durable, deterministic-service library with
-a fused simulation-testing harness — single node, single process.
-**Not yet:** replication, failover, cross-process transport, gateways,
-snapshotted (non-full-replay) recovery, benchmarks. The API will move.
+**Today (M0–M2):** a usable, durable, deterministic-service library with
+snapshot-accelerated recovery and a fused simulation-testing harness —
+single node, single process. **Not yet:** replication, failover,
+cross-process transport, gateways, journal compaction, benchmarks. The API
+will move.
 
 | Milestone | Scope | Status |
 |---|---|---|
 | M0 — Core + single node | `Service`/`Ctx`, codec + derives, segmented journal, replay recovery | ✅ |
 | M1 — Determinism harness | `ticktape-sim`: seeded storage faults, invariant checks, VOPR loop + shrinking | ✅ |
-| M2 — Snapshotting + flagship example | Snapshotter, `SnapshotMark`, fast recovery; a price-time-priority order book with no-trade-through / share-conservation invariants under simulation | next |
-| M3 — Transport | Shared-memory IPC ring; reliable sequenced UDP multicast (MoldUDP64-style A/B feeds) + retransmitter/gap-fill | |
+| M2 — Snapshotting + flagship example | Snapshot store, `SnapshotMark`, fast recovery; the order book with no-crossed-book / share-conservation invariants under simulation | ✅ |
+| M3 — Transport | Shared-memory IPC ring; reliable sequenced UDP multicast (MoldUDP64-style A/B feeds) + retransmitter/gap-fill | next |
 | M4 — Replication + failover | Async hot standby with epoch lease/fencing (the classic exchange mode); quorum-committed tier (VSR-shaped); leader kills and partitions in the simulator | |
 | M5 — Gateways | Client sessions: dedup, flow control, cancel-on-disconnect, drop-copy | |
 | M6 — Hardening | Performance benchmarks in CI, `io_uring` path, docs | |
@@ -321,8 +351,9 @@ Brian Nigito's [How to Build an Exchange](https://www.youtube.com/watch?v=b1e4t2
   tier pays a quorum round-trip. No hand-waving.
 - **Deriving `Encode`/`Decode` requires `ticktape-core` in your
   dependencies** (trait/derive split, as with serde).
-- **Recovery currently materializes the full journal** and recovers by full
-  replay; snapshot-based fast recovery is M2.
+- **Recovery still reads (and CRC-verifies) the full journal**; snapshots
+  skip re-*applying* old inputs, and segment skip-scan/compaction lands with
+  journal compaction.
 - The simulator does not yet model directory-entry loss on crash, reordered
   (non-prefix) page flushes, or multi-node faults (those arrive with M3/M4).
 

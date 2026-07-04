@@ -191,3 +191,91 @@ fn bus_delivers_sequenced_frames_in_order() {
     assert_eq!(frames[1].kind, FrameKind::Tick);
     assert_eq!(frames[2].seq, Seq(3));
 }
+
+fn snap_config(dir: &std::path::Path, every: u64) -> NodeConfig {
+    let mut config = config(dir);
+    config.snapshot_every = Some(every);
+    config
+}
+
+#[test]
+fn snapshots_enable_fast_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut node: Node<Meter, _> =
+            Node::open_with_clock(snap_config(dir.path(), 10), (), ManualClock(Timestamp(7)))
+                .unwrap();
+        for i in 1..=25 {
+            node.submit(Cmd::Bump(i)).unwrap();
+        }
+        // 25 inputs + interleaved SnapshotMark frames; crash (drop).
+    }
+    let node: Node<Meter, _> =
+        Node::open_with_clock(snap_config(dir.path(), 10), (), ManualClock(Timestamp(9))).unwrap();
+    let info = node.recovery_info();
+    let snap_seq = info.snapshot_seq.expect("must recover from a snapshot");
+    assert!(snap_seq.as_u64() >= 20, "stale snapshot used: {info:?}");
+    assert!(
+        info.inputs_replayed < 25,
+        "full replay despite snapshot: {info:?}"
+    );
+    // State identical to what full replay computes.
+    assert_eq!(node.service().total, (1..=25).sum::<i64>());
+    assert_eq!(node.service().last_bump_at, Timestamp(7));
+}
+
+#[test]
+fn corrupt_snapshot_falls_back_and_state_is_still_right() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut node: Node<Meter, _> =
+            Node::open_with_clock(snap_config(dir.path(), 5), (), ManualClock(Timestamp(3)))
+                .unwrap();
+        for i in 1..=12 {
+            node.submit(Cmd::Bump(i)).unwrap();
+        }
+    }
+    // Corrupt every snapshot file on disk.
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) == Some("snap") {
+            let mut bytes = std::fs::read(&path).unwrap();
+            let idx = bytes.len() / 2;
+            bytes[idx] ^= 0xFF;
+            std::fs::write(&path, &bytes).unwrap();
+        }
+    }
+    let node: Node<Meter, _> =
+        Node::open_with_clock(snap_config(dir.path(), 5), (), ManualClock(Timestamp(9))).unwrap();
+    assert_eq!(
+        node.recovery_info().snapshot_seq,
+        None,
+        "corrupt snapshots must be skipped"
+    );
+    assert_eq!(node.service().total, (1..=12).sum::<i64>());
+}
+
+#[test]
+fn snapshot_marks_appear_in_the_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node: Node<Meter, _> =
+        Node::open_with_clock(snap_config(dir.path(), 3), (), ManualClock(Timestamp(1))).unwrap();
+    let rx = node.subscribe();
+    for i in 1..=3 {
+        node.submit(Cmd::Bump(i)).unwrap();
+    }
+    let kinds: Vec<_> = rx.try_iter().map(|f| f.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            FrameKind::Input,
+            FrameKind::Input,
+            FrameKind::Input,
+            FrameKind::SnapshotMark
+        ],
+        "mark must follow the frame that hit the cadence"
+    );
+    // verify_replay still holds with marks in the journal.
+    let mut node = node;
+    assert!(node.verify_replay().unwrap());
+}

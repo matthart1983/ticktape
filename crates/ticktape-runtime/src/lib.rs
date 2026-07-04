@@ -12,9 +12,13 @@
 //! 3. **Execute**: run [`Service::apply`] exactly once per input, in seq
 //!    order, and hand back / publish the outputs.
 //!
-//! On [`Node::open`], state is rebuilt as `genesis + replay(journal)` —
-//! crash recovery is the same code path as normal startup. Snapshot-based
-//! fast recovery is M2.
+//! On [`Node::open`], state is rebuilt from the newest valid snapshot plus
+//! a replay of the journal tail (or `genesis + replay` from scratch when no
+//! snapshot exists) — crash recovery is the same code path as normal
+//! startup. With `NodeConfig::snapshot_every = Some(n)`, the node snapshots
+//! its state every `n` sequenced frames and appends a `SnapshotMark` frame;
+//! snapshots are an optimization, never the system of record — a corrupt or
+//! torn snapshot silently falls back to an older one or to full replay.
 //!
 //! The host is deliberately synchronous and single-threaded (run-to-
 //! completion per input); concurrency belongs at the edges, not in the
@@ -26,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ticktape_core::{
     decode_all, encode_to_vec, Ctx, Frame, FrameKind, OutBuf, Seq, Service, Timestamp,
 };
-use ticktape_journal::{Journal, JournalConfig, JournalError, RealStorage, Storage};
+use ticktape_journal::{Journal, JournalConfig, JournalError, RealStorage, SnapshotStore, Storage};
 
 pub use ticktape_journal::FsyncPolicy;
 
@@ -95,6 +99,10 @@ pub struct NodeConfig {
     pub journal: JournalConfig,
     /// Logical stream/topic stamped on every frame this node sequences.
     pub stream_id: u16,
+    /// Snapshot state every `n` sequenced frames (`None` = never; recovery
+    /// then always replays from genesis). Snapshots live next to the
+    /// journal segments as `.snap` files.
+    pub snapshot_every: Option<u64>,
 }
 
 impl NodeConfig {
@@ -102,8 +110,19 @@ impl NodeConfig {
         NodeConfig {
             journal: JournalConfig::new(journal_dir),
             stream_id: 1,
+            snapshot_every: None,
         }
     }
+}
+
+/// How the last [`Node::open_with`] rebuilt state — observability for the
+/// fast-recovery path (and for tests that assert it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryInfo {
+    /// The snapshot recovery restored from, if any.
+    pub snapshot_seq: Option<Seq>,
+    /// How many journaled inputs were applied on top.
+    pub inputs_replayed: u64,
 }
 
 /// The in-process sequenced-stream fan-out: every subscriber receives every
@@ -141,12 +160,15 @@ pub struct Node<S: Service, T: TimeSource = WallClock, St: Storage + Clone = Rea
     journal_config: JournalConfig,
     storage: St,
     journal: Journal<St>,
+    snapshots: SnapshotStore<St>,
+    snapshot_every: Option<u64>,
     clock: T,
     stream_id: u16,
     seq: Seq,
     last_timestamp: Timestamp,
     outputs: OutBuf<S::Output>,
     bus: InProcBus,
+    recovery: RecoveryInfo,
 }
 
 impl<S: Service> Node<S, WallClock> {
@@ -179,12 +201,37 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
     ) -> Result<Self, NodeError> {
         let journal_config = config.journal.clone();
         let recovered = Journal::open_with(config.journal, storage.clone())?;
-        let mut service = S::genesis(&service_config);
+        let snapshots = SnapshotStore::new(journal_config.dir.clone(), storage.clone());
+
+        // A crash that truncated the journal invalidates any snapshot taken
+        // past the surviving tail — that history no longer exists. Purge
+        // them before trusting anything.
+        snapshots.purge_after(recovered.journal.last_seq())?;
+
+        // Fast recovery: restore the newest valid snapshot at or before the
+        // journal tail, then replay only the frames after it. A snapshot
+        // whose payload no longer decodes is treated like a corrupt one:
+        // fall back to full replay (snapshots are never the record).
+        let mut from_seq = Seq::GENESIS;
+        let mut service = None;
+        if let Some(snap) = snapshots.load_latest(recovered.journal.last_seq())? {
+            if let Ok(decoded) = decode_all::<S::Snapshot>(&snap.payload) {
+                service = Some(S::restore(decoded, &service_config));
+                from_seq = snap.seq;
+            }
+        }
+        let snapshot_seq = (from_seq > Seq::GENESIS).then_some(from_seq);
+        let mut service = service.unwrap_or_else(|| S::genesis(&service_config));
+
         let mut outputs = OutBuf::new();
         let mut last_timestamp = Timestamp::ZERO;
+        let mut inputs_replayed = 0u64;
 
         for frame in &recovered.frames {
             last_timestamp = frame.timestamp;
+            if frame.seq <= from_seq {
+                continue; // captured by the snapshot
+            }
             if frame.kind == FrameKind::Input {
                 let input: S::Input =
                     decode_all(&frame.payload).map_err(|err| NodeError::CorruptInput {
@@ -196,6 +243,7 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
                 // Replayed outputs already had their effect (or were lost
                 // with the process); recovery discards them.
                 outputs.drain();
+                inputs_replayed += 1;
             }
         }
 
@@ -206,12 +254,18 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
             journal_config,
             storage,
             journal: recovered.journal,
+            snapshots,
+            snapshot_every: config.snapshot_every,
             clock,
             stream_id: config.stream_id,
             seq,
             last_timestamp,
             outputs,
             bus: InProcBus::new(),
+            recovery: RecoveryInfo {
+                snapshot_seq,
+                inputs_replayed,
+            },
         })
     }
 
@@ -226,6 +280,7 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         self.service.apply(frame.seq, &input, &mut ctx);
         let outputs = self.outputs.drain();
         self.bus.publish(&frame);
+        self.maybe_snapshot(frame.seq)?;
         Ok((frame.seq, outputs))
     }
 
@@ -235,7 +290,25 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         let frame = self.sequence(FrameKind::Tick, Vec::new())?;
         let seq = frame.seq;
         self.bus.publish(&frame);
+        self.maybe_snapshot(seq)?;
         Ok(seq)
+    }
+
+    /// Snapshot on cadence: state at `seq` is durably written *before* the
+    /// `SnapshotMark` frame advertises it. The mark itself never triggers
+    /// another snapshot.
+    fn maybe_snapshot(&mut self, seq: Seq) -> Result<(), NodeError> {
+        let Some(every) = self.snapshot_every else {
+            return Ok(());
+        };
+        if seq.0 % every.max(1) != 0 {
+            return Ok(());
+        }
+        let payload = encode_to_vec(&self.service.snapshot());
+        self.snapshots.write(seq, 0, &payload)?;
+        let mark = self.sequence(FrameKind::SnapshotMark, encode_to_vec(&seq))?;
+        self.bus.publish(&mark);
+        Ok(())
     }
 
     fn sequence(&mut self, kind: FrameKind, payload: Vec<u8>) -> Result<Frame, NodeError> {
@@ -262,9 +335,14 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         &self.service
     }
 
-    /// The seq of the last applied input ([`Seq::GENESIS`] if none).
+    /// The seq of the last sequenced frame ([`Seq::GENESIS`] if none).
     pub fn seq(&self) -> Seq {
         self.seq
+    }
+
+    /// How the last open rebuilt state (snapshot used, inputs replayed).
+    pub fn recovery_info(&self) -> RecoveryInfo {
+        self.recovery
     }
 
     /// Force the journal to stable storage (e.g. before a deliberate

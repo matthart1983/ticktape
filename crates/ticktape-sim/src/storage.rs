@@ -205,6 +205,15 @@ impl Storage for SimStorage {
         Ok(())
     }
 
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .files
+            .remove(path)
+            .map(|_| ())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))
+    }
+
     fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
         // Simplification: file creation is modeled as immediately durable
         // (directory-entry loss on crash is not simulated yet).
