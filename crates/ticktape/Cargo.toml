@@ -13,3 +13,4 @@ ticktape-codec.workspace = true
 ticktape-journal.workspace = true
 ticktape-runtime.workspace = true
 ticktape-transport.workspace = true
+ticktape-cluster.workspace = true
