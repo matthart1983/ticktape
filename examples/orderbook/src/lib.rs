@@ -346,6 +346,11 @@ impl OrderBook {
         self.index.len()
     }
 
+    /// Whether an order is currently resting on the book.
+    pub fn has_order(&self, id: OrderId) -> bool {
+        self.index.contains_key(&id)
+    }
+
     /// Depth view for display: (price, total qty), bids best-first then
     /// asks best-first.
     #[allow(clippy::type_complexity)]

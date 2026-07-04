@@ -14,9 +14,12 @@ seeded fault-injecting simulator that hammers *your* state machine with
 crashes and torn writes while checking durability, ordering, determinism,
 and your own invariants. A reliable sequenced UDP transport (A/B feeds +
 gap-fill) streams the total order to follower replicas that compute
-bit-identical state, and the failover machinery — epoch-lease elections,
+bit-identical state, the failover machinery — epoch-lease elections,
 fencing, quorum commit — is verified under a multi-node deterministic
-simulation with leader kills, partitions, and dueling candidates.
+simulation with leader kills, partitions, and dueling candidates, and a
+TCP gateway puts real clients in front of it all: session dedup
+(exactly-once effect despite retries), flow control, cancel-on-disconnect,
+and drop-copy.
 
 ```rust
 use ticktape::{Ctx, Decode, Encode, Node, NodeConfig, Seq, Service};
@@ -158,7 +161,12 @@ $ cargo run -p orderbook -- verify
 invariants: OK · replay equivalence: OK
 ```
 
-And the **multi-process demo**: a leader publishes its sequenced stream
+The **exchange demo** puts the order book behind the gateway — run
+`exchange serve`, connect interactive `exchange client` sessions and an
+`exchange watch` drop-copy observer, then kill a client mid-session and
+watch its resting orders get pulled deterministically.
+
+And the **multi-process feed demo**: a leader publishes its sequenced stream
 over UDP; followers in other processes replicate bit-identical state live,
 gap-filling anything lost from the retransmitter:
 
@@ -256,7 +264,8 @@ CI runs 2000 fresh seeds on every push.
 | `ticktape-sim` | The deterministic simulator: seeded RNG (SplitMix64, no `rand` dependency — archived seeds must never rot), simulated disk with crash semantics, virtual clock, `Invariants`, the VOPR loop, and the `vopr` binary. |
 | `ticktape-transport` | Reliable sequenced-stream transport, MoldUDP64/SoupBinTCP-shaped: A/B UDP feed redundancy, heartbeat high-water marks, gap detection by seq, unicast TCP range retransmission, late-join catch-up, and `Replica` — a follower that recomputes the service from the ordered stream. The reliability core (`Reassembler`) is a pure state machine, fuzzed across 200 seeds of loss/duplication/reordering. |
 | `ticktape-cluster` | The failover machinery as pure state machines: epoch-lease election (Paxos-phase-1-shaped — provably at most one leader per epoch), the `EpochChange` fence, and Tier 2 quorum-commit tracking. Verified in a multi-node deterministic simulation: leader kills, partitions, zombie leaders, dueling candidates, lagging replicas — asserting split-brain safety, Tier 2 no-committed-loss, Tier 1 bounded loss, and bit-identical convergence. A negative test proves disabled fencing is *detected*. |
-| `examples/counter`, `examples/kv`, `examples/orderbook`, `examples/feed` | The hello world; the smallest real service; the flagship price-time-priority CLOB; and the multi-process leader/follower feed demo. `kv` and `orderbook` are fuzzed by the simulator in `cargo test`. |
+| `ticktape-gateway` | The edge: per-session monotonic-seq dedup (exactly-once effect under retries), windowed flow control (window 1 = the classic single-outstanding discipline), gap rejection, cancel-on-disconnect injected as a *sequenced input*, drop-copy observers, and a threaded TCP server hosting any session-aware `Service`. Session envelopes go through the journal, so dedup state is deterministic, replicated, and survives restarts. |
+| `examples/counter`, `examples/kv`, `examples/orderbook`, `examples/feed`, `examples/exchange` | The hello world; the smallest real service; the flagship price-time-priority CLOB; the multi-process leader/follower feed demo; and the exchange — the order book behind the TCP gateway, driven by real clients in `cargo test` and fuzzed with session traffic under fault injection. |
 
 ## How determinism is enforced (not hoped for)
 
@@ -308,14 +317,16 @@ schema evolution never touches framework wire stability.
 
 ## Status & roadmap
 
-**Today (M0–M4):** a usable, durable, deterministic-service library with
+**Today (M0–M5):** a usable, durable, deterministic-service library with
 snapshot-accelerated recovery, a fused simulation-testing harness, a
-reliable sequenced transport feeding cross-process follower replicas, and
-simulation-verified failover machinery (elections, fencing, quorum commit).
-**Not yet:** a packaged clustered-server binary wiring these pieces to live
-timers and sockets end-to-end, gateways, journal compaction, a
-shared-memory IPC ring, the `openraft` delegation backend, acceptor-crash
-faults in the simulator, benchmarks. The API will move.
+reliable sequenced transport feeding cross-process follower replicas,
+simulation-verified failover machinery (elections, fencing, quorum
+commit), and a TCP gateway with sessions, dedup, flow control,
+cancel-on-disconnect, and drop-copy. **Not yet:** a packaged
+clustered-server binary wiring cluster + transport + gateway to live
+timers end-to-end, journal compaction, a shared-memory IPC ring, the
+`openraft` delegation backend, acceptor-crash faults in the simulator,
+benchmarks (M6). The API will move.
 
 | Milestone | Scope | Status |
 |---|---|---|
@@ -324,8 +335,8 @@ faults in the simulator, benchmarks. The API will move.
 | M2 — Snapshotting + flagship example | Snapshot store, `SnapshotMark`, fast recovery; the order book with no-crossed-book / share-conservation invariants under simulation | ✅ |
 | M3 — Transport | Reliable sequenced UDP (MoldUDP64-style A/B feeds), TCP gap-fill retransmitter, follower `Replica`; shm IPC ring deferred to the perf pass | ✅ |
 | M4 — Replication + failover | Epoch-lease elections + fencing (Tier 1, the classic exchange mode) and VSR-shaped quorum commit (Tier 2); leader kills, partitions, and dueling candidates in the simulator | ✅ |
-| M5 — Gateways | Client sessions: dedup, flow control, cancel-on-disconnect, drop-copy; a packaged clustered-server binary | next |
-| M6 — Hardening | Performance benchmarks in CI, `io_uring` path, docs | |
+| M5 — Gateways | Client sessions: dedup, flow control, cancel-on-disconnect, drop-copy; external clients drive the order book end-to-end over TCP | ✅ |
+| M6 — Hardening | Performance benchmarks in CI, `io_uring` path, the packaged clustered-server binary, docs | next |
 
 Performance numbers are deliberately absent until M6 measures them —
 budgets, not marketing.

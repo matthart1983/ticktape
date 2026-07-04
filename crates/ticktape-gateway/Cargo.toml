@@ -1,0 +1,17 @@
+[package]
+name = "ticktape-gateway"
+description = "Client gateway for Ticktape services: session dedup, flow control, cancel-on-disconnect, drop-copy, and a TCP server hosting any session-aware Service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ticktape-core.workspace = true
+ticktape-journal.workspace = true
+ticktape-runtime.workspace = true
+
+[dev-dependencies]
+ticktape-codec.workspace = true
+tempfile = "3"

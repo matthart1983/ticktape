@@ -1,0 +1,17 @@
+[package]
+name = "exchange"
+description = "Ticktape M5 example: the order book behind a TCP gateway — sessions, dedup, cancel-on-disconnect, drop-copy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ticktape.workspace = true
+ticktape-core.workspace = true
+ticktape-gateway = { path = "../../crates/ticktape-gateway" }
+ticktape-sim.workspace = true
+orderbook = { path = "../orderbook" }
+
+[dev-dependencies]
+tempfile = "3"

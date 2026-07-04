@@ -14,3 +14,4 @@ ticktape-journal.workspace = true
 ticktape-runtime.workspace = true
 ticktape-transport.workspace = true
 ticktape-cluster.workspace = true
+ticktape-gateway.workspace = true
