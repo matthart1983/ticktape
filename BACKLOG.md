@@ -6,62 +6,56 @@ priority order, each with why it matters and what "done" means. Nothing
 here is hidden in the code — there are no `TODO`s or stubs; everything
 below works as documented but is incomplete as a product.
 
-## P0 — correctness-adjacent traps (a real user hits these first)
+**Priority order (revised 2026-07-05):** ranked by practitioner feedback
+from a builder of a production core-derived platform (SBE/Aeron stack).
+Their two disqualifiers for platforms in this space — *can it run
+24×7/365 without filling a disk* and *is every component redundant* — are
+P0. Everything else follows.
 
-### 1. Events to offline sessions are silently dropped
-`gateway::server` routes an `Addressed` event only to live sinks; a client
-that reconnects has missed everything in between, and drop-copy observers
-cannot backfill. Real session protocols (SoupBinTCP) make the per-session
-outbound stream itself sequenced and replayable.
-**Done means:** each session's outbound events carry a per-session sequence
-number; the gateway retains a bounded per-session outbox (or derives it
-from the journal on demand); `Hello { session, from_event_seq }` replays
-the gap on reconnect; drop-copy can join from any point. Covered by an e2e
-test that kills a client, trades against its book, reconnects, and sees
-the missed fills.
+## P0 — platform viability (the practitioner's disqualifiers)
 
-### 2. Unbounded growth in three stores — i.e. no 24×7/365 operation yet
-Practitioner framing (from a review of core-derived production platforms):
-this is exactly the property that disqualifies jimgreco/core for continuous
-operation — "no snapshot service and it doesn't prune the journal" — and
-the property Aeron Cluster is prized for (snapshots + journal pruning so
-disk never fills). ticktape already has the snapshot half (M2, with
-corrupt-fallback and stale-purge); the pruning half below is what turns
-"runs for a session" into "runs forever".
-- `transport::MemStore` (retransmit) never evicts — a long-running feed
-  leaks its entire history in memory. Fix: split the retransmitter the
-  way jimgreco/core splits `MoldRepeater`/`MoldRewinder` — a **repeater**
-  serving live gap-fill from a bounded in-memory recent window, and a
-  **rewinder** serving historical ranges by reading journal segments.
-  (This also fixes the feed example's late-join-across-restart gap, P3.)
-- Old snapshot files are never pruned (`purge_after` removes only
+### 1. 24×7/365 continuous operation — bounded disk and memory, forever
+This is exactly the property that disqualifies jimgreco/core for
+continuous operation — "no snapshot service and it doesn't prune the
+journal" — and the property Aeron Cluster is prized for (snapshots +
+journal pruning so disk never fills). ticktape already has the snapshot
+half (M2, with corrupt-fallback and stale-purge); the pruning half below
+is what turns "runs for a session" into "runs forever". Three unbounded
+stores today:
+
+- **Journal segments accumulate forever.** Fix: compaction —
+  archive/delete segments wholly below the newest durable snapshot (the
+  spec's §12 note). This also unlocks true fast recovery: today recovery
+  still reads and CRC-verifies every segment even when a snapshot skips
+  the re-apply, so post-compaction recovery cost is bounded by snapshot
+  cadence, not journal age.
+- **Old snapshot files are never pruned** (`purge_after` removes only
   *fenced* ones). Fix: keep the newest N valid snapshots, delete the rest
   at snapshot time.
-- Journal segments accumulate forever. Fix: compaction — archive/delete
-  segments wholly below the newest durable snapshot (this is the spec's
-  §12 note, and it also unlocks true fast recovery: today recovery still
-  reads and CRC-verifies every segment even when a snapshot skips the
-  re-apply).
+- **`transport::MemStore` (retransmit) never evicts** — a long-running
+  feed leaks its entire history in memory. Fix: split the retransmitter
+  the way jimgreco/core splits `MoldRepeater`/`MoldRewinder` — a
+  **repeater** serving live gap-fill from a bounded in-memory recent
+  window, and a **rewinder** serving historical ranges by reading journal
+  segments (post-compaction: snapshot + tail, which is also how late
+  joiners bootstrap without full history). This also fixes the feed
+  example's late-join-across-restart gap (P3).
 
 **Done means:** a week-long soak of the feed example holds steady RSS and
 disk bounded by config; recovery time is bounded by snapshot cadence, not
 journal age — i.e. **continuous 24×7/365 operation with no restart or
-day-roll required**.
+day-roll required, ever**.
 
-### 3. Gateway flow control cannot actually throttle
-`SessionFlow` windows are correct and unit-tested, but the live server
-acks synchronously inside `submit`, so `outstanding` never exceeds 1 and
-`Throttled` is unreachable. The window becomes real only with deferred
-acks (see P1.2). Until then this is a documented no-op — the risk is
-someone reading the code and believing backpressure exists.
-**Done means:** either deferred-ack mode lands (below), or the server
-config states plainly that window > 1 has no effect in synchronous mode.
+### 2. No single point of failure — the replicated deployment
+"The sequencer needs several running at the same time; the journal also
+needs several running, replicated, so that all the single points of
+failure are removed." In this architecture a *replicated journal* is not
+a separate subsystem — every replica journals the stream it applies, and
+Tier 2 commits only what a majority has durably journaled, so journal
+redundancy falls out of deterministic replay; the cluster sim already
+proves no-committed-loss across leader kills and partitions. What's
+missing is the **packaged deployment** that makes it real on live sockets.
 
-## P1 — the milestone-sized gap: machinery ⇒ product
-
-### 1. A packaged clustered server (end to end; manual promotion first)
-Elections, fencing, and quorum commit are proven in the deterministic
-cluster simulation — but nothing wires them to live sockets and timers.
 **Ship in two stages.** Stage A: **manual promotion** — an operator runs
 `promote`, which executes election + fence + reconcile using the machinery
 the sim already proved. This is a legitimate production posture with
@@ -85,22 +79,17 @@ Missing pieces, in dependency order:
   makes the sequencer swappable;
 - an **activation-graph-lite** (core's `Activator` pattern: per-component
   ready/started/active states with dependency-ordered start/stop, and
-  lifecycle events published into the stream) as the skeleton that wires
-  journal + transport + gateway + election into one process;
+  lifecycle events published into the stream — core runs every app as an
+  activatable master/replica pair; that's the model);
+- **auxiliary services redundant the same way**: any replica can serve
+  repeater/rewinder gap-fill from its own journal, and snapshots are
+  taken on replicas (spec §12), so no component of a deployment is
+  unique;
 - Stage B only: a failure detector (missed-heartbeat count over the
   existing transport heartbeats) driving candidacy;
 - standby promotion wiring: reconcile-with-fences (the rule the sim
   forced), adopt the feed publisher role, emit `EpochChange`, gateway
   fail-over of client connections.
-
-**No single point of failure, stated explicitly:** in this architecture a
-"replicated journal" is not a separate subsystem — every replica journals
-the stream it applies, and Tier 2 commits only what a majority has durably
-journaled, so journal redundancy falls out of deterministic replay. The
-packaged server should make the *auxiliary* services redundant the same
-way: any replica can serve repeater/rewinder gap-fill from its own
-journal, and snapshots are taken on replicas (spec §12), so no component
-of a deployment is unique.
 
 **Done means (Stage A):** operator-promoted failover of a 3-node exchange
 deployment with no committed loss (Tier 2) and clients resuming sessions.
@@ -108,17 +97,50 @@ deployment with no committed loss (Tier 2) and clients resuming sessions.
 the heartbeat timeout; the cluster sim's invariants hold on the real
 deployment's journals afterwards.
 
-### 2. Tier 2 in the runtime: deferred acks
+## P1 — correctness traps and product machinery
+
+### 1. Admin/observability plane
+ticktape components expose nothing — not even counters. Both reviewed
+systems treat operability as a product feature, and the practitioner
+called it out specifically: core lets you telnet into any service node
+for an interactive shell — inspect state, submit commands, JMX-style —
+plus a web console. Minimal version first: a stats struct per component
+(sequencer seq + commit watermark, journal bytes + segment count, snapshot
+age, session count + per-session seqs, retransmit window depth, gap-fill
+counts) surfaced by the packaged server on one plain-text/HTTP endpoint.
+An interactive admin channel (pause / promote / snapshot-now / prune) is
+the natural second step and shares plumbing with P0.2's Stage-A manual
+promotion.
+**Done means:** an operator can answer "is it healthy, how far behind is
+the standby, when was the last snapshot" with curl, no debugger.
+
+### 2. Events to offline sessions are silently dropped
+`gateway::server` routes an `Addressed` event only to live sinks; a client
+that reconnects has missed everything in between, and drop-copy observers
+cannot backfill. Real session protocols (SoupBinTCP) make the per-session
+outbound stream itself sequenced and replayable.
+**Done means:** each session's outbound events carry a per-session sequence
+number; the gateway retains a bounded per-session outbox (or derives it
+from the journal on demand); `Hello { session, from_event_seq }` replays
+the gap on reconnect; drop-copy can join from any point. Covered by an e2e
+test that kills a client, trades against its book, reconnects, and sees
+the missed fills.
+
+### 3. Tier 2 in the runtime: deferred acks
 `CommitTracker` exists; `Node` doesn't use it. Quorum commit requires
 splitting `submit` into sequence/journal (returns pending handle) and a
 commit watermark that releases outputs + acks. This is also what makes
-gateway windows real (P0.3) and unlocks genuine group-commit batching
-(P2.1) — three gaps, one architectural change.
+gateway flow-control windows real (today `SessionFlow` windows are
+correct and unit-tested, but the live server acks synchronously inside
+`submit`, so `outstanding` never exceeds 1 and `Throttled` is unreachable
+— a documented no-op until this lands) and unlocks genuine group-commit
+batching (P2.1) — three gaps, one architectural change.
 **Done means:** a `Node` mode where outputs/acks release at the commit
 watermark, exercised by the cluster sim invariants against the *runtime*
-rather than the test harness's own bookkeeping.
+rather than the test harness's own bookkeeping. Until then, the server
+config states plainly that window > 1 has no effect in synchronous mode.
 
-### 3. Deterministic timers (capability gap — from the core/Coral review)
+### 4. Deterministic timers (capability gap — from the core/Coral review)
 Services can read sequenced time but cannot schedule against it: there is
 no way to express "cancel this order in 30s", GTD expiry, auction phases,
 or deterministic timeouts — bread-and-butter exchange logic. jimgreco/core
@@ -134,22 +156,6 @@ for free.
 expire identically on live, replay, and replica paths, verified under the
 simulator; timer state survives snapshot-based recovery.
 
-### 4. Admin/observability plane
-ticktape components expose nothing — not even counters. Both reviewed
-systems treat operability as a product feature (core: command shell with
-`@Command`/`@Property` introspection over telnet/HTTP + metrics; Coral:
-monitoring tooling). Minimal version: a stats struct per component
-(sequencer seq + commit watermark, journal bytes + segment count, snapshot
-age, session count + per-session seqs, retransmit window depth, gap-fill
-counts) surfaced by the packaged server on one plain-text/HTTP endpoint.
-Practitioner precedent goes further — core lets you telnet into any node
-for an interactive shell (inspect state, submit admin commands, JMX-style)
-plus a web console. Stats endpoint first; an interactive admin channel
-(pause/promote/snapshot-now/prune) is the natural second step and shares
-plumbing with Stage-A manual promotion.
-**Done means:** an operator can answer "is it healthy, how far behind is
-the standby, when was the last snapshot" with curl, no debugger.
-
 ## P2 — the named performance workstream (budgets currently missed)
 
 Benchmarked gaps (see README Performance): synced-fsync p99 budget of
@@ -158,14 +164,15 @@ throughput budget vs 0.8–1.7 M/s.
 
 1. **Async group commit**: batch concurrent ingress into one
    `pwritev` + `fdatasync` per window with deferred acks (depends on
-   P1.2). This is the single change that makes the synced budgets
+   P1.3). This is the single change that makes the synced budgets
    reachable.
 2. **Packet batching** in the transport publisher (fill to
    `MAX_PACKET_BYTES` instead of one frame per packet).
 3. **`io_uring` / `O_DIRECT`** journal path (Linux, feature-gated).
 4. **Shared-memory IPC ring** for same-box fan-out (the spec's IpcShm).
 5. **Streaming replay** — recovery iterates segments instead of
-   materializing `Vec<Frame>` (memory ∝ journal size today).
+   materializing `Vec<Frame>` (memory ∝ journal size today; P0.1
+   compaction bounds the size, this removes the materialization).
 6. **Allocation-free hot path** — jimgreco/core is obsessively
    zero-allocation (Agrona buffers, garbage-free collections); we allocate
    per frame (`Vec<u8>` payloads, `encode_to_vec` per message, clones per
@@ -176,17 +183,6 @@ throughput budget vs 0.8–1.7 M/s.
 
 ## P3 — polish, tooling, and honesty upkeep
 
-- Simulator gaps: acceptor crash/restart faults (with persisted
-  `promised`), directory-entry loss on crash, non-prefix page flushes,
-  multi-node transport faults driven through the real `Reassembler`.
-- Derive macros: generic type support (removes the hand-written codecs in
-  `ticktape-gateway`).
-- Test the `UnixDatagram` packet source (implemented, unused by tests).
-- Feed example: backfill the retransmit store from the recovered journal
-  so late joiners work across leader restarts (today: documented "wipe
-  the journal").
-- `openraft` delegation backend behind a `raft-backend` feature (spec §9
-  open question — build only if someone actually wants it).
 - **SBE codec adapter** (spec §6 tier 3) — practitioner platforms in this
   space serialize with SBE; an adapter makes ticktape services interoperable
   with that ecosystem without abandoning the canonical `fixed` tier.
@@ -208,21 +204,35 @@ throughput budget vs 0.8–1.7 M/s.
   version: a schema-version field in the stream's first frame (and in
   `EpochChange`), so a replica rejects a mismatched `Input` schema
   explicitly instead of failing on decode.
+- Simulator gaps: acceptor crash/restart faults (with persisted
+  `promised`), directory-entry loss on crash, non-prefix page flushes,
+  multi-node transport faults driven through the real `Reassembler`.
+- Derive macros: generic type support (removes the hand-written codecs in
+  `ticktape-gateway`).
+- Test the `UnixDatagram` packet source (implemented, unused by tests).
+- Feed example: backfill the retransmit store from the recovered journal
+  so late joiners work across leader restarts (subsumed by P0.1's
+  rewinder).
+- `openraft` delegation backend behind a `raft-backend` feature (spec §9
+  open question — build only if someone actually wants it).
 - Docs: a short book / teaching deck (spec M6 item, deferred).
 - **Decisions pending**: crates.io publish (names unclaimed — cheap
-  insurance, do early) and the `v1.0.0` tag (recommend: after P0 and
-  P1.1, which is when "use this for something real" stops needing
-  caveats).
+  insurance, do early) and the `v1.0.0` tag (recommend: after P0, which
+  is when "use this for something real" stops needing caveats).
 
 ---
 
-*2026-07-05: P0.2's repeater/rewinder design, P1.1's staging + command
-channel + activation graph, P1.3 (timers), P1.4 (admin plane), P2.6
-(zero-alloc), and the `WIRE.md`/schema-handshake items come from a
-comparative review of jimgreco/core and CoralSequencer — two production
-sequencer platforms whose deltas against ticktape were: timers, operability,
-bus-level command ingress, and app-lifecycle activation. Nothing in either
-system contradicted the architecture.*
+*2026-07-05 (revision 2): priorities re-ranked around direct feedback from
+a practitioner who built a production platform on the jimgreco/core model
+(SBE serialization, Aeron transport, Aeron Archiver journal). Their
+disqualifiers — no 24×7/365 operation without snapshot+prune, and any
+remaining single point of failure — are now P0.1 and P0.2. Their
+operability bar (telnet shell into any node, web console, master/replica
+activation pairs) drives P1.1 and the activation-graph item. Earlier
+provenance: the 2026-07-05 comparative review of jimgreco/core and
+CoralSequencer contributed the timers, repeater/rewinder, command-channel,
+zero-alloc, WIRE.md, and schema-handshake items. Nothing in either system
+or the practitioner feedback contradicted the architecture.*
 
 *Rule of the house: when an item ships, move its line to the README/CHANGELOG;
 when a new gap is found, it lands here — never silently.*
