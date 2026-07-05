@@ -41,21 +41,27 @@
 //! - **Tier 2** — quorum-committed: one replication round-trip on the
 //!   commit path buys no-loss failover. The simulator asserts it.
 //!
+//! Acceptor state durability: [`PersistentAcceptor`] writes `promised` to
+//! stable storage before every grant (the fix for double-election across a
+//! restart), and [`AcceptorServer`]/[`run_election`] carry votes over TCP.
+//!
 //! Not in this milestone, documented: the `openraft` delegation backend
 //! (the builtin VSR-style quorum is what the simulator can prove; a
-//! `raft-backend` feature remains open in the spec), acceptor-state
-//! durability across acceptor restarts (acceptors must persist `promised`;
-//! the simulator does not yet crash acceptors), and live lease renewal
+//! `raft-backend` feature remains open in the spec) and live lease renewal
 //! timers (the simulator schedules suspicion adversarially instead, which
 //! covers strictly more interleavings than any timer would).
 
 pub mod commit;
 pub mod election;
 pub mod epoch;
+pub mod net;
+pub mod persist;
 
 pub use commit::CommitTracker;
 pub use election::{Acceptor, Election, ElectionOutcome, VoteReply, VoteRequest};
 pub use epoch::EpochChange;
+pub use net::{run_election, AcceptorServer};
+pub use persist::{PersistError, PersistentAcceptor};
 
 /// Which durability tier a cluster runs (spec §9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

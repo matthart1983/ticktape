@@ -10,7 +10,9 @@ rust-version.workspace = true
 [dependencies]
 ticktape-core.workspace = true
 ticktape-transport.workspace = true
+ticktape-journal.workspace = true
 
 [dev-dependencies]
 ticktape-sim.workspace = true
 ticktape-codec.workspace = true
+tempfile = "3"
