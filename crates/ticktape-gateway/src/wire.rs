@@ -5,16 +5,16 @@
 //! deterministic history. [`ClientMsg`]/[`ServerMsg`] are the *edge*
 //! protocol, length-prefixed over TCP.
 //!
-//! These are generic over the application's command/event types, and the
-//! derive macros don't support generics yet, so the codecs are manual —
-//! same canonical rules (little-endian, u16 discriminants in declaration
-//! order).
+//! These are generic over the application's command/event types; the derive
+//! macros support generics, so the codecs are derived — same canonical rules
+//! (little-endian, u16 discriminants in declaration order) as any other
+//! `#[derive(Encode, Decode)]` type.
 
 use std::io::{Read, Write};
-use ticktape_core::{CodecError, Decode, Encode};
+use ticktape_codec::{Decode, Encode};
 
 /// What the gateway injects into the sequencer on behalf of clients.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum GatewayInput<C> {
     /// An admitted client command, tagged with its session and the
     /// client's own sequence number (journaled ⇒ dedup state is
@@ -29,81 +29,17 @@ pub enum GatewayInput<C> {
     SessionClosed { session: u64 },
 }
 
-impl<C: Encode> Encode for GatewayInput<C> {
-    fn encode(&self, out: &mut Vec<u8>) {
-        match self {
-            GatewayInput::Client {
-                session,
-                client_seq,
-                cmd,
-            } => {
-                0u16.encode(out);
-                session.encode(out);
-                client_seq.encode(out);
-                cmd.encode(out);
-            }
-            GatewayInput::SessionClosed { session } => {
-                1u16.encode(out);
-                session.encode(out);
-            }
-        }
-    }
-
-    fn encoded_len(&self) -> usize {
-        match self {
-            GatewayInput::Client { cmd, .. } => 2 + 8 + 8 + cmd.encoded_len(),
-            GatewayInput::SessionClosed { .. } => 2 + 8,
-        }
-    }
-}
-
-impl<C: Decode> Decode for GatewayInput<C> {
-    fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
-        match u16::decode(buf)? {
-            0 => Ok(GatewayInput::Client {
-                session: u64::decode(buf)?,
-                client_seq: u64::decode(buf)?,
-                cmd: C::decode(buf)?,
-            }),
-            1 => Ok(GatewayInput::SessionClosed {
-                session: u64::decode(buf)?,
-            }),
-            _ => Err(CodecError::InvalidValue("GatewayInput discriminant")),
-        }
-    }
-}
-
 /// An output event addressed to the session that must see it. A service
 /// emits one `Addressed` per interested party (an exchange addresses a
 /// trade to both taker and maker sessions).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Addressed<E> {
     pub session: u64,
     pub event: E,
 }
 
-impl<E: Encode> Encode for Addressed<E> {
-    fn encode(&self, out: &mut Vec<u8>) {
-        self.session.encode(out);
-        self.event.encode(out);
-    }
-
-    fn encoded_len(&self) -> usize {
-        8 + self.event.encoded_len()
-    }
-}
-
-impl<E: Decode> Decode for Addressed<E> {
-    fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
-        Ok(Addressed {
-            session: u64::decode(buf)?,
-            event: E::decode(buf)?,
-        })
-    }
-}
-
 /// Why the gateway refused a command (edge protocol, not sequenced).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub enum RejectReason {
     /// Retry of an already-admitted seq — the effect already happened.
     Duplicate,
@@ -114,7 +50,7 @@ pub enum RejectReason {
 }
 
 /// Client → gateway messages.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum ClientMsg<C> {
     /// First message on a command connection. Reconnecting with the same
     /// session id resumes its dedup state; `from_event_seq` is the last
@@ -139,63 +75,8 @@ pub enum ClientMsg<C> {
     },
 }
 
-impl<C: Encode> Encode for ClientMsg<C> {
-    fn encode(&self, out: &mut Vec<u8>) {
-        match self {
-            ClientMsg::Hello {
-                session,
-                from_event_seq,
-            } => {
-                0u16.encode(out);
-                session.encode(out);
-                from_event_seq.encode(out);
-            }
-            ClientMsg::DropCopy {
-                session,
-                from_event_seq,
-            } => {
-                1u16.encode(out);
-                session.encode(out);
-                from_event_seq.encode(out);
-            }
-            ClientMsg::Cmd { client_seq, cmd } => {
-                2u16.encode(out);
-                client_seq.encode(out);
-                cmd.encode(out);
-            }
-        }
-    }
-
-    fn encoded_len(&self) -> usize {
-        match self {
-            ClientMsg::Hello { .. } | ClientMsg::DropCopy { .. } => 2 + 8 + 8,
-            ClientMsg::Cmd { cmd, .. } => 2 + 8 + cmd.encoded_len(),
-        }
-    }
-}
-
-impl<C: Decode> Decode for ClientMsg<C> {
-    fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
-        match u16::decode(buf)? {
-            0 => Ok(ClientMsg::Hello {
-                session: u64::decode(buf)?,
-                from_event_seq: u64::decode(buf)?,
-            }),
-            1 => Ok(ClientMsg::DropCopy {
-                session: u64::decode(buf)?,
-                from_event_seq: u64::decode(buf)?,
-            }),
-            2 => Ok(ClientMsg::Cmd {
-                client_seq: u64::decode(buf)?,
-                cmd: C::decode(buf)?,
-            }),
-            _ => Err(CodecError::InvalidValue("ClientMsg discriminant")),
-        }
-    }
-}
-
 /// Gateway → client messages.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum ServerMsg<E> {
     /// `client_seq` was sequenced at global `seq`.
     Ack { client_seq: u64, seq: u64 },
@@ -210,79 +91,6 @@ pub enum ServerMsg<E> {
         client_seq: u64,
         reason: RejectReason,
     },
-}
-
-impl<E: Encode> Encode for ServerMsg<E> {
-    fn encode(&self, out: &mut Vec<u8>) {
-        match self {
-            ServerMsg::Ack { client_seq, seq } => {
-                0u16.encode(out);
-                client_seq.encode(out);
-                seq.encode(out);
-            }
-            ServerMsg::Event { event_seq, event } => {
-                1u16.encode(out);
-                event_seq.encode(out);
-                event.encode(out);
-            }
-            ServerMsg::Rejected { client_seq, reason } => {
-                2u16.encode(out);
-                client_seq.encode(out);
-                match reason {
-                    RejectReason::Duplicate => 0u16.encode(out),
-                    RejectReason::Gap { expected } => {
-                        1u16.encode(out);
-                        expected.encode(out);
-                    }
-                    RejectReason::Throttled => 2u16.encode(out),
-                }
-            }
-        }
-    }
-
-    fn encoded_len(&self) -> usize {
-        match self {
-            ServerMsg::Ack { .. } => 2 + 8 + 8,
-            ServerMsg::Event { event, .. } => 2 + 8 + event.encoded_len(),
-            ServerMsg::Rejected { reason, .. } => {
-                2 + 8
-                    + 2
-                    + if matches!(reason, RejectReason::Gap { .. }) {
-                        8
-                    } else {
-                        0
-                    }
-            }
-        }
-    }
-}
-
-impl<E: Decode> Decode for ServerMsg<E> {
-    fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
-        match u16::decode(buf)? {
-            0 => Ok(ServerMsg::Ack {
-                client_seq: u64::decode(buf)?,
-                seq: u64::decode(buf)?,
-            }),
-            1 => Ok(ServerMsg::Event {
-                event_seq: u64::decode(buf)?,
-                event: E::decode(buf)?,
-            }),
-            2 => {
-                let client_seq = u64::decode(buf)?;
-                let reason = match u16::decode(buf)? {
-                    0 => RejectReason::Duplicate,
-                    1 => RejectReason::Gap {
-                        expected: u64::decode(buf)?,
-                    },
-                    2 => RejectReason::Throttled,
-                    _ => return Err(CodecError::InvalidValue("RejectReason discriminant")),
-                };
-                Ok(ServerMsg::Rejected { client_seq, reason })
-            }
-            _ => Err(CodecError::InvalidValue("ServerMsg discriminant")),
-        }
-    }
 }
 
 /// Write one length-prefixed message.

@@ -37,15 +37,22 @@ pub fn derive_decode(input: TokenStream) -> TokenStream {
         .into()
 }
 
-fn check_no_generics(ast: &DeriveInput) -> syn::Result<()> {
-    if ast.generics.params.is_empty() {
-        Ok(())
-    } else {
-        Err(syn::Error::new_spanned(
-            &ast.generics,
-            "ticktape codec derives do not support generic types yet",
-        ))
+/// Build the `impl` header pieces for a (possibly generic) type, bounding
+/// every generic type parameter by the given codec trait (`Encode`/`Decode`)
+/// so `Foo<T>` derives an impl valid whenever `T` is itself codable. Returns
+/// owned token streams for the impl-generics, type-generics, and where-clause.
+fn impl_header(
+    generics: &syn::Generics,
+    bound: &syn::TypeParamBound,
+) -> (TokenStream2, TokenStream2, TokenStream2) {
+    let mut g = generics.clone();
+    for param in &mut g.params {
+        if let syn::GenericParam::Type(tp) = param {
+            tp.bounds.push(bound.clone());
+        }
     }
+    let (imp, ty, whr) = g.split_for_impl();
+    (quote!(#imp), quote!(#ty), quote!(#whr))
 }
 
 fn variant_count_check(ast: &DeriveInput, count: usize) -> syn::Result<()> {
@@ -59,9 +66,10 @@ fn variant_count_check(ast: &DeriveInput, count: usize) -> syn::Result<()> {
 }
 
 fn expand_encode(ast: &DeriveInput) -> syn::Result<TokenStream2> {
-    check_no_generics(ast)?;
     let core = core_path();
     let name = &ast.ident;
+    let bound: syn::TypeParamBound = syn::parse_quote!(#core::Encode);
+    let (impl_g, ty_g, where_g) = impl_header(&ast.generics, &bound);
 
     let (encode_body, len_body) = match &ast.data {
         Data::Struct(data) => {
@@ -109,7 +117,7 @@ fn expand_encode(ast: &DeriveInput) -> syn::Result<TokenStream2> {
     };
 
     Ok(quote! {
-        impl #core::Encode for #name {
+        impl #impl_g #core::Encode for #name #ty_g #where_g {
             fn encode(&self, out: &mut ::std::vec::Vec<u8>) {
                 #encode_body
             }
@@ -121,9 +129,10 @@ fn expand_encode(ast: &DeriveInput) -> syn::Result<TokenStream2> {
 }
 
 fn expand_decode(ast: &DeriveInput) -> syn::Result<TokenStream2> {
-    check_no_generics(ast)?;
     let core = core_path();
     let name = &ast.ident;
+    let bound: syn::TypeParamBound = syn::parse_quote!(#core::Decode);
+    let (impl_g, ty_g, where_g) = impl_header(&ast.generics, &bound);
 
     let body = match &ast.data {
         Data::Struct(data) => {
@@ -154,7 +163,7 @@ fn expand_decode(ast: &DeriveInput) -> syn::Result<TokenStream2> {
     };
 
     Ok(quote! {
-        impl #core::Decode for #name {
+        impl #impl_g #core::Decode for #name #ty_g #where_g {
             fn decode(buf: &mut &[u8]) -> ::core::result::Result<Self, #core::CodecError> {
                 #body
             }

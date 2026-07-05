@@ -65,6 +65,20 @@ mod tests {
         Nested(Named),
     }
 
+    // Generic types: the impl is bounded so `Wrap<T>` / `Env<T>` derive
+    // whenever `T` is itself codable.
+    #[derive(Encode, Decode, PartialEq, Debug)]
+    struct Wrap<T> {
+        tag: u16,
+        value: T,
+    }
+
+    #[derive(Encode, Decode, PartialEq, Debug)]
+    enum Env<T> {
+        Empty,
+        Full { id: u64, payload: T },
+    }
+
     fn roundtrip<T: Encode + Decode + PartialEq + std::fmt::Debug>(value: T) {
         let bytes = encode_to_vec(&value);
         assert_eq!(bytes.len(), value.encoded_len(), "encoded_len mismatch");
@@ -94,6 +108,35 @@ mod tests {
             c: vec![],
             d: None,
         }));
+    }
+
+    #[test]
+    fn derived_generic_roundtrip() {
+        roundtrip(Wrap {
+            tag: 7,
+            value: String::from("hi"),
+        });
+        roundtrip(Wrap {
+            tag: 1,
+            value: vec![1u32, 2, 3],
+        });
+        roundtrip(Env::<u64>::Empty);
+        roundtrip(Env::Full {
+            id: 42,
+            payload: Tuple(3, "x".into()),
+        });
+    }
+
+    #[test]
+    fn generic_bytes_match_the_monomorphized_layout() {
+        // A generic derive must produce the same bytes as writing the fields
+        // out by hand — the wire format is the type's layout, not its
+        // genericity. Wrap<u32>{tag, value} = [tag u16][value u32].
+        let bytes = encode_to_vec(&Wrap { tag: 0x0102u16, value: 0x0304_0506u32 });
+        let mut expected = Vec::new();
+        0x0102u16.encode(&mut expected);
+        0x0304_0506u32.encode(&mut expected);
+        assert_eq!(bytes, expected);
     }
 
     #[test]
