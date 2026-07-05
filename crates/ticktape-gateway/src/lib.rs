@@ -22,6 +22,13 @@
 //! - **Drop-copy.** Any number of independent observers may subscribe to a
 //!   session's outcomes; they receive the same [`Addressed`] events the
 //!   client does, derived from the same sequenced stream.
+//! - **Per-session outbox + reconnect replay.** Every outbound event carries
+//!   a monotonic per-session `event_seq` and is retained in a bounded
+//!   per-session outbox — even while the session is offline, so nothing is
+//!   silently dropped. A command client or drop-copy observer reconnects
+//!   with `from_event_seq` and the gateway backfills exactly the events it
+//!   missed (SoupBinTCP-style replayable session stream); falling past the
+//!   outbox floor surfaces as an `event_seq` gap the client resyncs from.
 //!
 //! The application opts in by shaping its `Service` around the envelopes:
 //! `Input = GatewayInput<YourCmd>`, `Output = Addressed<YourEvt>` — the

@@ -62,12 +62,27 @@ fn run_server(addr: &str) {
         resume.len()
     );
     let listener = TcpListener::bind(addr).expect("bind");
-    serve(node, listener, ServeConfig { window: 64, resume });
+    serve(
+        node,
+        listener,
+        ServeConfig {
+            window: 64,
+            resume,
+            ..ServeConfig::default()
+        },
+    );
 }
 
 fn run_client(addr: &str, session: u64) {
     let mut stream = TcpStream::connect(addr).expect("connect");
-    write_msg(&mut stream, &ClientMsg::<Cmd>::Hello { session }).expect("hello");
+    write_msg(
+        &mut stream,
+        &ClientMsg::<Cmd>::Hello {
+            session,
+            from_event_seq: 0,
+        },
+    )
+    .expect("hello");
     let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
     std::thread::spawn(move || loop {
         match read_msg::<ServerMsg<Evt>>(&mut reader) {
@@ -115,7 +130,14 @@ fn run_client(addr: &str, session: u64) {
 
 fn run_watcher(addr: &str, session: u64) {
     let mut stream = TcpStream::connect(addr).expect("connect");
-    write_msg(&mut stream, &ClientMsg::<Cmd>::DropCopy { session }).expect("hello");
+    write_msg(
+        &mut stream,
+        &ClientMsg::<Cmd>::DropCopy {
+            session,
+            from_event_seq: 0,
+        },
+    )
+    .expect("hello");
     println!("drop-copy: watching session {session}");
     let mut reader = std::io::BufReader::new(stream);
     loop {

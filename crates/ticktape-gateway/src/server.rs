@@ -13,7 +13,7 @@
 
 use crate::flow::{Admit, SessionFlow};
 use crate::wire::{read_msg, Addressed, ClientMsg, GatewayInput, RejectReason, ServerMsg};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
@@ -29,6 +29,13 @@ pub struct ServeConfig {
     /// `(session, last_admitted_client_seq)`. Compute from the recovered
     /// service state before serving so restarts keep dedup exact.
     pub resume: Vec<(u64, u64)>,
+    /// How many recent outbound events to retain per session for reconnect
+    /// replay. A reconnecting client (or drop-copy observer) that is within
+    /// this many events of the tip gets an exact backfill; one that fell
+    /// further behind sees an `event_seq` gap and must resync. Bounds gateway
+    /// memory — the outbox is the edge-side analogue of the journal's bounded
+    /// retention.
+    pub outbox_capacity: usize,
 }
 
 impl Default for ServeConfig {
@@ -36,19 +43,23 @@ impl Default for ServeConfig {
         ServeConfig {
             window: 64,
             resume: Vec::new(),
+            outbox_capacity: 1024,
         }
     }
 }
 
 enum Req<C> {
-    /// A command connection claimed `session`; replies flow to `sink`.
+    /// A command connection claimed `session`; replies flow to `sink`, and
+    /// events after `from_event_seq` are replayed from the outbox.
     Attach {
         session: u64,
+        from_event_seq: u64,
         sink: mpsc::Sender<Vec<u8>>,
     },
-    /// A drop-copy observer for `session`.
+    /// A drop-copy observer for `session`, replaying from `from_event_seq`.
     Watch {
         session: u64,
+        from_event_seq: u64,
         sink: mpsc::Sender<Vec<u8>>,
     },
     Cmd {
@@ -60,9 +71,35 @@ enum Req<C> {
     Close { session: u64 },
 }
 
+/// Per-session edge state: the live sinks plus a bounded replay outbox.
 struct SessionSinks {
     cmd: Option<mpsc::Sender<Vec<u8>>>,
     watchers: Vec<mpsc::Sender<Vec<u8>>>,
+    /// The next per-session `event_seq` to assign (monotonic from 1).
+    next_event_seq: u64,
+    /// Recent outbound events as `(event_seq, encoded ServerMsg::Event)`,
+    /// oldest first, capped at `outbox_capacity` — the reconnect backfill.
+    outbox: VecDeque<(u64, Vec<u8>)>,
+}
+
+impl SessionSinks {
+    fn new() -> Self {
+        SessionSinks {
+            cmd: None,
+            watchers: Vec::new(),
+            next_event_seq: 1,
+            outbox: VecDeque::new(),
+        }
+    }
+
+    /// Every `event_seq > from` still held, in order — the reconnect backfill.
+    fn replay_after(&self, from: u64) -> Vec<Vec<u8>> {
+        self.outbox
+            .iter()
+            .filter(|(eseq, _)| *eseq > from)
+            .map(|(_, bytes)| bytes.clone())
+            .collect()
+    }
 }
 
 /// Serve `node` on `listener`, forever. Run on a dedicated thread.
@@ -105,36 +142,53 @@ fn sequencer_loop<S, C, E, T, St>(
         .map(|&(session, last)| (session, SessionFlow::resume(last, config.window)))
         .collect();
     let mut sinks: BTreeMap<u64, SessionSinks> = BTreeMap::new();
+    let cap = config.outbox_capacity;
 
     while let Ok(req) = req_rx.recv() {
         match req {
-            Req::Attach { session, sink } => {
+            Req::Attach {
+                session,
+                from_event_seq,
+                sink,
+            } => {
                 flows
                     .entry(session)
                     .or_insert_with(|| SessionFlow::new(config.window));
-                sinks
-                    .entry(session)
-                    .or_insert_with(|| SessionSinks {
-                        cmd: None,
-                        watchers: Vec::new(),
-                    })
-                    .cmd = Some(sink);
+                let entry = sinks.entry(session).or_insert_with(SessionSinks::new);
+                entry.cmd = Some(sink.clone());
+                // Backfill the gap this client missed while disconnected.
+                for bytes in entry.replay_after(from_event_seq) {
+                    if sink.send(bytes).is_err() {
+                        entry.cmd = None;
+                        break;
+                    }
+                }
             }
-            Req::Watch { session, sink } => {
+            Req::Watch {
+                session,
+                from_event_seq,
+                sink,
+            } => {
                 // Registration is acked (client_seq 0) so observers know
                 // they are live before events they must not miss occur.
                 let _ = sink.send(encode_msg::<E>(&ServerMsg::Ack {
                     client_seq: 0,
                     seq: 0,
                 }));
-                sinks
-                    .entry(session)
-                    .or_insert_with(|| SessionSinks {
-                        cmd: None,
-                        watchers: Vec::new(),
-                    })
-                    .watchers
-                    .push(sink);
+                let entry = sinks.entry(session).or_insert_with(SessionSinks::new);
+                // A drop-copy observer can join from any point still held.
+                // Replay before registering, so a dead observer never lands
+                // in the live set (and ordering stays backfill-then-live).
+                let mut alive = true;
+                for bytes in entry.replay_after(from_event_seq) {
+                    if sink.send(bytes).is_err() {
+                        alive = false;
+                        break;
+                    }
+                }
+                if alive {
+                    entry.watchers.push(sink);
+                }
             }
             Req::Cmd {
                 session,
@@ -163,7 +217,7 @@ fn sequencer_loop<S, C, E, T, St>(
                                         seq: seq.as_u64(),
                                     },
                                 );
-                                route_events(&mut sinks, outputs);
+                                route_events(&mut sinks, outputs, cap);
                             }
                             Err(e) => {
                                 // Journal failure: the input was not
@@ -207,7 +261,7 @@ fn sequencer_loop<S, C, E, T, St>(
                 // Deterministic cancel-on-disconnect: the close itself is a
                 // sequenced input, identical on every replica and replay.
                 match node.submit(GatewayInput::SessionClosed { session }) {
-                    Ok((_seq, outputs)) => route_events(&mut sinks, outputs),
+                    Ok((_seq, outputs)) => route_events(&mut sinks, outputs, cap),
                     Err(e) => eprintln!("gateway: session-close submit failed: {e}"),
                 }
             }
@@ -237,13 +291,29 @@ fn send_to_cmd<E: Encode>(
     }
 }
 
-fn route_events<E: Encode>(sinks: &mut BTreeMap<u64, SessionSinks>, outputs: Vec<Addressed<E>>) {
+fn route_events<E: Encode>(
+    sinks: &mut BTreeMap<u64, SessionSinks>,
+    outputs: Vec<Addressed<E>>,
+    outbox_capacity: usize,
+) {
     for addressed in outputs {
         let session = addressed.session;
-        let Some(entry) = sinks.get_mut(&session) else {
-            continue; // no live connection or watcher; events are not queued
-        };
-        let bytes = encode_msg(&ServerMsg::Event(addressed.event));
+        // Create the session entry even with no live connection: the event
+        // still gets an event_seq and lands in the outbox, so a client that
+        // reconnects later can replay it. This is the fix for P1.2 — events
+        // for offline sessions are retained, not silently dropped.
+        let entry = sinks.entry(session).or_insert_with(SessionSinks::new);
+        let event_seq = entry.next_event_seq;
+        entry.next_event_seq += 1;
+        let bytes = encode_msg(&ServerMsg::Event {
+            event_seq,
+            event: addressed.event,
+        });
+        // Retain for reconnect replay, bounded (drop the oldest past the cap).
+        entry.outbox.push_back((event_seq, bytes.clone()));
+        while entry.outbox.len() > outbox_capacity {
+            entry.outbox.pop_front();
+        }
         if let Some(cmd) = &entry.cmd {
             if cmd.send(bytes.clone()).is_err() {
                 entry.cmd = None;
@@ -278,16 +348,24 @@ fn connection_loop<C: Encode + Decode>(stream: TcpStream, req_tx: mpsc::Sender<R
     });
 
     let session = match hello {
-        ClientMsg::Hello { session } => {
+        ClientMsg::Hello {
+            session,
+            from_event_seq,
+        } => {
             let _ = req_tx.send(Req::Attach {
                 session,
+                from_event_seq,
                 sink: sink_tx,
             });
             session
         }
-        ClientMsg::DropCopy { session } => {
+        ClientMsg::DropCopy {
+            session,
+            from_event_seq,
+        } => {
             let _ = req_tx.send(Req::Watch {
                 session,
+                from_event_seq,
                 sink: sink_tx,
             });
             // Observers only listen; hold the connection open until EOF.

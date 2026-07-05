@@ -16,20 +16,37 @@ struct Client {
     stream: TcpStream,
     reader: BufReader<TcpStream>,
     client_seq: u64,
+    /// Highest per-session event_seq seen — passed as `from_event_seq` on
+    /// reconnect to backfill exactly the gap.
+    last_event_seq: u64,
 }
 
 impl Client {
     fn connect(addr: std::net::SocketAddr, session: u64) -> Client {
+        Client::resume(addr, session, 0)
+    }
+
+    /// Connect (or reconnect) requesting replay of events after
+    /// `from_event_seq`.
+    fn resume(addr: std::net::SocketAddr, session: u64, from_event_seq: u64) -> Client {
         let mut stream = TcpStream::connect(addr).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        write_msg(&mut stream, &ClientMsg::<Cmd>::Hello { session }).unwrap();
+        write_msg(
+            &mut stream,
+            &ClientMsg::<Cmd>::Hello {
+                session,
+                from_event_seq,
+            },
+        )
+        .unwrap();
         let reader = BufReader::new(stream.try_clone().unwrap());
         Client {
             stream,
             reader,
             client_seq: 0,
+            last_event_seq: from_event_seq,
         }
     }
 
@@ -44,7 +61,19 @@ impl Client {
     }
 
     fn recv(&mut self) -> ServerMsg<Evt> {
-        read_msg(&mut self.reader).unwrap().expect("server closed")
+        let msg = read_msg(&mut self.reader).unwrap().expect("server closed");
+        if let ServerMsg::Event { event_seq, .. } = &msg {
+            self.last_event_seq = self.last_event_seq.max(*event_seq);
+        }
+        msg
+    }
+
+    /// The event payload of the next message, asserting it is an Event.
+    fn recv_event(&mut self) -> Evt {
+        match self.recv() {
+            ServerMsg::Event { event, .. } => event,
+            other => panic!("expected an event, got {other:?}"),
+        }
     }
 
     /// Receive until an Ack or Rejected arrives; return it plus the events
@@ -53,8 +82,61 @@ impl Client {
         let mut events = Vec::new();
         loop {
             match self.recv() {
-                ServerMsg::Event(event) => events.push(event),
+                ServerMsg::Event { event, .. } => events.push(event),
                 outcome => return (outcome, events),
+            }
+        }
+    }
+}
+
+/// A drop-copy observer connection, able to (re)join from a given
+/// `from_event_seq` and read the events addressed to a session.
+struct Observer {
+    reader: BufReader<TcpStream>,
+    last_event_seq: u64,
+}
+
+impl Observer {
+    fn watch(addr: std::net::SocketAddr, session: u64, from_event_seq: u64) -> Observer {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write_msg(
+            &mut stream,
+            &ClientMsg::<Cmd>::DropCopy {
+                session,
+                from_event_seq,
+            },
+        )
+        .unwrap();
+        let mut reader = BufReader::new(stream);
+        // The registration ack proves the observer is live before we assert.
+        assert!(matches!(
+            read_msg::<ServerMsg<Evt>>(&mut reader).unwrap(),
+            Some(ServerMsg::Ack { client_seq: 0, .. })
+        ));
+        Observer {
+            reader,
+            last_event_seq: from_event_seq,
+        }
+    }
+
+    /// Next event, tracking the running event_seq (asserting monotonicity).
+    fn recv_event(&mut self) -> (u64, Evt) {
+        loop {
+            match read_msg::<ServerMsg<Evt>>(&mut self.reader).unwrap() {
+                Some(ServerMsg::Event { event_seq, event }) => {
+                    assert!(
+                        event_seq > self.last_event_seq,
+                        "event_seq must be strictly increasing: {event_seq} after {}",
+                        self.last_event_seq
+                    );
+                    self.last_event_seq = event_seq;
+                    return (event_seq, event);
+                }
+                Some(_) => {}
+                None => panic!("observer disconnected early"),
             }
         }
     }
@@ -99,9 +181,7 @@ fn clients_trade_and_both_sides_hear_about_it() {
     // Events may arrive before or after the ack; collect either way.
     let mut maker_events = events;
     if maker_events.is_empty() {
-        if let ServerMsg::Event(e) = maker.recv() {
-            maker_events.push(e);
-        }
+        maker_events.push(maker.recv_event());
     }
     assert_eq!(maker_events, vec![Evt::Accepted { id: 11 }]);
 
@@ -111,9 +191,7 @@ fn clients_trade_and_both_sides_hear_about_it() {
     // Taker hears its accept + the trade at the maker's price.
     let mut taker_events = Vec::new();
     while taker_events.len() < 2 {
-        if let ServerMsg::Event(e) = taker.recv() {
-            taker_events.push(e);
-        }
+        taker_events.push(taker.recv_event());
     }
     assert_eq!(
         taker_events,
@@ -128,9 +206,7 @@ fn clients_trade_and_both_sides_hear_about_it() {
         ]
     );
     // The maker's session is told about its fill too.
-    let ServerMsg::Event(fill) = maker.recv() else {
-        panic!("maker must hear the trade")
-    };
+    let fill = maker.recv_event();
     assert_eq!(
         fill,
         Evt::Trade {
@@ -189,10 +265,7 @@ fn retries_are_exactly_once_and_gaps_are_rejected() {
     let (ack, events) = client.recv_outcome();
     assert!(matches!(ack, ServerMsg::Ack { client_seq: 2, .. }));
     let canceled = if events.is_empty() {
-        match client.recv() {
-            ServerMsg::Event(e) => e,
-            other => panic!("{other:?}"),
-        }
+        client.recv_event()
     } else {
         events[0].clone()
     };
@@ -216,7 +289,10 @@ fn disconnect_pulls_resting_orders_and_drop_copy_sees_it_all() {
         .unwrap();
     write_msg(
         &mut watcher_stream,
-        &ClientMsg::<Cmd>::DropCopy { session: 3 },
+        &ClientMsg::<Cmd>::DropCopy {
+            session: 3,
+            from_event_seq: 0,
+        },
     )
     .unwrap();
     let mut watcher = BufReader::new(watcher_stream);
@@ -238,7 +314,7 @@ fn disconnect_pulls_resting_orders_and_drop_copy_sees_it_all() {
     let mut seen = Vec::new();
     while seen.len() < 2 {
         match read_msg::<ServerMsg<Evt>>(&mut watcher).unwrap() {
-            Some(ServerMsg::Event(e)) => seen.push(e),
+            Some(ServerMsg::Event { event, .. }) => seen.push(event),
             Some(_) => {}
             None => panic!("watcher disconnected early"),
         }
@@ -259,9 +335,7 @@ fn disconnect_pulls_resting_orders_and_drop_copy_sees_it_all() {
     let mut probe = Client::connect(addr, 4);
     probe.send(submit(41, Side::Sell, 95, 25));
     let (_ack, _) = probe.recv_outcome();
-    let ServerMsg::Event(accepted) = probe.recv() else {
-        panic!("expected accept")
-    };
+    let accepted = probe.recv_event();
     assert_eq!(accepted, Evt::Accepted { id: 41 });
     // No trade event follows; the next thing this session could hear would
     // require new activity. (A fill would have arrived with the accept.)
@@ -291,4 +365,105 @@ fn reconnect_resumes_dedup_state() {
     second.send_seq(2, submit(92, Side::Sell, 101, 5));
     let (ack, _) = second.recv_outcome();
     assert!(matches!(ack, ServerMsg::Ack { client_seq: 2, .. }));
+}
+
+// ---- P1.2: per-session outbox + reconnect replay ----
+
+#[test]
+fn drop_copy_observer_replays_the_fills_it_missed_while_disconnected() {
+    // The headline scenario: an observer watches a maker's session, drops
+    // offline, the maker's resting book trades while it is gone, and on
+    // reconnect the observer replays exactly the fills it missed — no gap,
+    // no duplication. (The maker stays connected, so its orders survive; the
+    // observer is the party that reconnects.)
+    let addr = start_exchange();
+
+    // Maker rests a big sell on session 1.
+    let mut maker = Client::connect(addr, 1);
+    maker.send(submit(11, Side::Sell, 102, 100));
+    let (ack, _) = maker.recv_outcome();
+    assert!(matches!(ack, ServerMsg::Ack { .. }));
+
+    // Compliance watches session 1 from the start and sees the Accepted
+    // (event_seq 1), then goes offline.
+    let mut observer = Observer::watch(addr, 1, 0);
+    let (seq1, e1) = observer.recv_event();
+    assert_eq!((seq1, e1), (1, Evt::Accepted { id: 11 }));
+    let seen_through = observer.last_event_seq; // == 1
+    drop(observer);
+
+    // While the observer is gone, a taker lifts part of the maker's order.
+    let mut taker = Client::connect(addr, 2);
+    taker.send(submit(21, Side::Buy, 105, 40));
+    let (ack, _) = taker.recv_outcome();
+    assert!(matches!(ack, ServerMsg::Ack { .. }));
+    // Drain the maker's stream up to and including its own live fill (the
+    // Accepted may still be buffered after the earlier ack), so the trade is
+    // provably sequenced before the observer reconnects.
+    let trade = Evt::Trade {
+        taker: 21,
+        maker: 11,
+        price: 102,
+        qty: 40,
+    };
+    loop {
+        if maker.recv_event() == trade {
+            break;
+        }
+    }
+
+    // The observer reconnects from where it left off and must replay the
+    // maker's fill (event_seq 2) — the event it missed while offline.
+    let mut observer = Observer::watch(addr, 1, seen_through);
+    let (seq2, e2) = observer.recv_event();
+    assert_eq!(
+        (seq2, e2),
+        (
+            2,
+            Evt::Trade {
+                taker: 21,
+                maker: 11,
+                price: 102,
+                qty: 40
+            }
+        ),
+        "observer must replay exactly the fill it missed"
+    );
+}
+
+#[test]
+fn a_reconnecting_command_client_is_backfilled_its_missed_events() {
+    // A command client rests an order and disconnects; cancel-on-disconnect
+    // generates a Canceled event it never saw. On reconnect (resuming from
+    // its last seen event_seq) the gateway backfills that missed event.
+    let addr = start_exchange();
+
+    let mut client = Client::connect(addr, 8);
+    client.send(submit(81, Side::Sell, 100, 7));
+    let (ack, mut events) = client.recv_outcome();
+    assert!(matches!(ack, ServerMsg::Ack { .. }));
+    if events.is_empty() {
+        events.push(client.recv_event());
+    }
+    assert_eq!(events, vec![Evt::Accepted { id: 81 }]);
+    let seen_through = client.last_event_seq; // Accepted == event_seq 1
+    drop(client); // cancel-on-disconnect pulls order 81 while we are away
+
+    // Reconnect resuming from the Accepted; the missed Canceled (whether it
+    // was sequenced just before or just after we re-attach) must reach us —
+    // as backfill if it landed first, live otherwise.
+    let mut client = Client::resume(addr, 8, seen_through);
+    let canceled = client.recv_event();
+    assert_eq!(
+        canceled,
+        Evt::Canceled {
+            id: 81,
+            remaining: 7
+        },
+        "the reconnecting client must be told its order was pulled"
+    );
+    assert!(
+        client.last_event_seq > seen_through,
+        "the backfilled event advances the client's event_seq"
+    );
 }

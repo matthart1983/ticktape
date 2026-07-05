@@ -117,14 +117,21 @@ pub enum RejectReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientMsg<C> {
     /// First message on a command connection. Reconnecting with the same
-    /// session id resumes its dedup state.
+    /// session id resumes its dedup state; `from_event_seq` is the last
+    /// per-session `event_seq` the client durably saw, so the gateway
+    /// replays everything after it from its outbox (`0` = "I have nothing,
+    /// send whatever you still hold").
     Hello {
         session: u64,
+        from_event_seq: u64,
     },
     /// First message on an observer connection: receive a copy of every
-    /// event addressed to `session`.
+    /// event addressed to `session`, replaying from `from_event_seq` so a
+    /// drop-copy observer can join (or rejoin) from any point it still has
+    /// in the outbox.
     DropCopy {
         session: u64,
+        from_event_seq: u64,
     },
     Cmd {
         client_seq: u64,
@@ -135,13 +142,21 @@ pub enum ClientMsg<C> {
 impl<C: Encode> Encode for ClientMsg<C> {
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            ClientMsg::Hello { session } => {
+            ClientMsg::Hello {
+                session,
+                from_event_seq,
+            } => {
                 0u16.encode(out);
                 session.encode(out);
+                from_event_seq.encode(out);
             }
-            ClientMsg::DropCopy { session } => {
+            ClientMsg::DropCopy {
+                session,
+                from_event_seq,
+            } => {
                 1u16.encode(out);
                 session.encode(out);
+                from_event_seq.encode(out);
             }
             ClientMsg::Cmd { client_seq, cmd } => {
                 2u16.encode(out);
@@ -153,7 +168,7 @@ impl<C: Encode> Encode for ClientMsg<C> {
 
     fn encoded_len(&self) -> usize {
         match self {
-            ClientMsg::Hello { .. } | ClientMsg::DropCopy { .. } => 2 + 8,
+            ClientMsg::Hello { .. } | ClientMsg::DropCopy { .. } => 2 + 8 + 8,
             ClientMsg::Cmd { cmd, .. } => 2 + 8 + cmd.encoded_len(),
         }
     }
@@ -164,9 +179,11 @@ impl<C: Decode> Decode for ClientMsg<C> {
         match u16::decode(buf)? {
             0 => Ok(ClientMsg::Hello {
                 session: u64::decode(buf)?,
+                from_event_seq: u64::decode(buf)?,
             }),
             1 => Ok(ClientMsg::DropCopy {
                 session: u64::decode(buf)?,
+                from_event_seq: u64::decode(buf)?,
             }),
             2 => Ok(ClientMsg::Cmd {
                 client_seq: u64::decode(buf)?,
@@ -182,8 +199,13 @@ impl<C: Decode> Decode for ClientMsg<C> {
 pub enum ServerMsg<E> {
     /// `client_seq` was sequenced at global `seq`.
     Ack { client_seq: u64, seq: u64 },
-    /// An event addressed to this session (or watched via drop-copy).
-    Event(E),
+    /// An event addressed to this session (or watched via drop-copy), tagged
+    /// with its monotonic per-session `event_seq`. A client tracks the
+    /// highest `event_seq` it has processed and passes it as `from_event_seq`
+    /// on reconnect; a gap (received `event_seq` > expected) means the
+    /// outbox was trimmed past the client's position and a full resync is
+    /// needed.
+    Event { event_seq: u64, event: E },
     Rejected {
         client_seq: u64,
         reason: RejectReason,
@@ -198,8 +220,9 @@ impl<E: Encode> Encode for ServerMsg<E> {
                 client_seq.encode(out);
                 seq.encode(out);
             }
-            ServerMsg::Event(event) => {
+            ServerMsg::Event { event_seq, event } => {
                 1u16.encode(out);
+                event_seq.encode(out);
                 event.encode(out);
             }
             ServerMsg::Rejected { client_seq, reason } => {
@@ -220,7 +243,7 @@ impl<E: Encode> Encode for ServerMsg<E> {
     fn encoded_len(&self) -> usize {
         match self {
             ServerMsg::Ack { .. } => 2 + 8 + 8,
-            ServerMsg::Event(event) => 2 + event.encoded_len(),
+            ServerMsg::Event { event, .. } => 2 + 8 + event.encoded_len(),
             ServerMsg::Rejected { reason, .. } => {
                 2 + 8
                     + 2
@@ -241,7 +264,10 @@ impl<E: Decode> Decode for ServerMsg<E> {
                 client_seq: u64::decode(buf)?,
                 seq: u64::decode(buf)?,
             }),
-            1 => Ok(ServerMsg::Event(E::decode(buf)?)),
+            1 => Ok(ServerMsg::Event {
+                event_seq: u64::decode(buf)?,
+                event: E::decode(buf)?,
+            }),
             2 => {
                 let client_seq = u64::decode(buf)?;
                 let reason = match u16::decode(buf)? {
@@ -328,7 +354,10 @@ mod tests {
                 client_seq: 1,
                 seq: 42,
             },
-            ServerMsg::Event("hello".into()),
+            ServerMsg::Event {
+                event_seq: 1,
+                event: "hello".into(),
+            },
             ServerMsg::Rejected {
                 client_seq: 2,
                 reason: RejectReason::Gap { expected: 2 },

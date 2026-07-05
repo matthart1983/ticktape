@@ -265,7 +265,7 @@ CI runs 2000 fresh seeds on every push.
 | `ticktape-sim` | The deterministic simulator: seeded RNG (SplitMix64, no `rand` dependency — archived seeds must never rot), simulated disk with crash semantics, virtual clock, `Invariants`, the VOPR loop, and the `vopr` binary. |
 | `ticktape-transport` | Reliable sequenced-stream transport, MoldUDP64/SoupBinTCP-shaped: A/B UDP feed redundancy, heartbeat high-water marks, gap detection by seq, unicast TCP range retransmission, late-join catch-up, and `Replica` — a follower that recomputes the service from the ordered stream. The reliability core (`Reassembler`) is a pure state machine, fuzzed across 200 seeds of loss/duplication/reordering. |
 | `ticktape-cluster` | The failover machinery as pure state machines: epoch-lease election (Paxos-phase-1-shaped — provably at most one leader per epoch), the `EpochChange` fence, and Tier 2 quorum-commit tracking. Verified in a multi-node deterministic simulation: leader kills, partitions, zombie leaders, dueling candidates, lagging replicas — asserting split-brain safety, Tier 2 no-committed-loss, Tier 1 bounded loss, and bit-identical convergence. A negative test proves disabled fencing is *detected*. |
-| `ticktape-gateway` | The edge: per-session monotonic-seq dedup (exactly-once effect under retries), windowed flow control (window 1 = the classic single-outstanding discipline), gap rejection, cancel-on-disconnect injected as a *sequenced input*, drop-copy observers, and a threaded TCP server hosting any session-aware `Service`. Session envelopes go through the journal, so dedup state is deterministic, replicated, and survives restarts. |
+| `ticktape-gateway` | The edge: per-session monotonic-seq dedup (exactly-once effect under retries), windowed flow control (window 1 = the classic single-outstanding discipline), gap rejection, cancel-on-disconnect injected as a *sequenced input*, drop-copy observers, and a per-session replayable outbox — every outbound event carries a monotonic `event_seq`, so a client or observer reconnects with `from_event_seq` and is backfilled exactly what it missed (SoupBinTCP-style). A threaded TCP server hosts any session-aware `Service`; session envelopes go through the journal, so dedup state is deterministic, replicated, and survives restarts. |
 | `examples/counter`, `examples/kv`, `examples/orderbook`, `examples/feed`, `examples/exchange` | The hello world; the smallest real service; the flagship price-time-priority CLOB; the multi-process leader/follower feed demo; and the exchange — the order book behind the TCP gateway, driven by real clients in `cargo test` and fuzzed with session traffic under fault injection. |
 
 ## How determinism is enforced (not hoped for)
@@ -351,9 +351,8 @@ arrive — proven by a 300-seed differential simulation against the runtime's
 own machinery plus a 200-seed crash run showing no committed output is lost
 across power loss. What remains is audited in
 [BACKLOG.md](BACKLOG.md): wiring the Tier-2 deferred-ack mode to a
-live follower ack channel in the packaged server, offline-session
-event replay, and the async group-commit/`io_uring`
-performance workstream.
+live follower ack channel in the packaged server and the async
+group-commit/`io_uring` performance workstream.
 Operators get a Prometheus `/metrics` endpoint per server (role, replication
 lag, snapshot seq, disk) to watch a deployment and drive failover. The API
 will still move.

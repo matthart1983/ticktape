@@ -126,17 +126,26 @@ the higher-value half and shipped first. Not yet surfaced: per-session
 gateway stats + commit watermark (the packaged server doesn't host the
 gateway yet).
 
-### 2. Events to offline sessions are silently dropped
-`gateway::server` routes an `Addressed` event only to live sinks; a client
-that reconnects has missed everything in between, and drop-copy observers
-cannot backfill. Real session protocols (SoupBinTCP) make the per-session
-outbound stream itself sequenced and replayable.
-**Done means:** each session's outbound events carry a per-session sequence
-number; the gateway retains a bounded per-session outbox (or derives it
-from the journal on demand); `Hello { session, from_event_seq }` replays
-the gap on reconnect; drop-copy can join from any point. Covered by an e2e
-test that kills a client, trades against its book, reconnects, and sees
-the missed fills.
+### ✅ 2. Events to offline sessions are silently dropped — DONE (v0.15.0)
+Fixed the drop: `route_events` now assigns each session's outbound events a
+monotonic per-session `event_seq` and retains them in a bounded per-session
+outbox (`ServeConfig::outbox_capacity`, default 1024), *creating the session
+entry even when no connection is live* — so events for an offline session
+accumulate rather than vanish. `ServerMsg::Event { event_seq, event }`
+carries the seq to the client; `Hello { session, from_event_seq }` and
+`DropCopy { session, from_event_seq }` replay everything after that point on
+(re)connect, so a command client or a drop-copy observer resumes from any
+position still in the outbox (a received `event_seq` gap means it fell past
+the retention floor and must resync). **Verified** (`exchange/tests/e2e.rs`):
+a drop-copy observer watches a maker's session, drops offline, the maker's
+resting book trades while it is gone, and on reconnect it replays *exactly*
+the fill it missed (event_seq 2, no gap/dup); and a reconnecting command
+client is backfilled the cancel-on-disconnect event it never saw. Flake-
+checked 5×. **Follow-up:** `event_seq` is an in-memory per-gateway counter,
+so it resets on a *gateway* restart (a client reconnecting across that sees
+the seq rewind and resyncs) — deriving it from the journal for cross-restart
+continuity is the "or derives it from the journal on demand" option, left
+for when the packaged server hosts the gateway.
 
 ### ✅ 3. Tier 2 in the runtime: deferred acks — DONE (v0.12.0)
 The `Node` now has a quorum-commit mode (`NodeConfig::with_quorum(voters,
