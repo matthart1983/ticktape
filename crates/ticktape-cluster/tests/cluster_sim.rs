@@ -462,6 +462,7 @@ impl Sim {
         let change = EpochChange {
             epoch,
             first_seq: Seq(fence + 1),
+            schema_version: 0,
         };
         let frame = change.to_frame(Timestamp(self.clock), STREAM);
         self.record_assignment(&frame, epoch)?;

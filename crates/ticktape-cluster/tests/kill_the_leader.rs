@@ -62,6 +62,7 @@ fn kill_the_leader_and_continue() {
     let fence = EpochChange {
         epoch,
         first_seq: sync_to.next(),
+        schema_version: 0,
     }
     .to_frame(Timestamp(200_000), 1);
     stream.push(fence.clone());

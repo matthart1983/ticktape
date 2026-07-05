@@ -36,8 +36,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ticktape_cluster::{run_election, AcceptorServer, ElectionOutcome, PersistentAcceptor};
-use ticktape_core::{decode_all, encode_to_vec, Frame, FrameKind, Seq, Service};
+use ticktape_cluster::{run_election, AcceptorServer, ElectionOutcome, EpochChange, PersistentAcceptor};
+use ticktape_core::{encode_to_vec, Frame, FrameKind, Seq, Service};
 use ticktape_journal::{FsyncPolicy, Journal, JournalConfig, RealStorage};
 use ticktape_runtime::{Node, NodeConfig};
 use ticktape_transport::{
@@ -413,8 +413,8 @@ where
                         // than re-bidding one already won (disjoint field
                         // borrow from `f`).
                         if frame.kind == FrameKind::EpochChange {
-                            if let Ok((epoch, _next)) = decode_all::<(u64, u64)>(&frame.payload) {
-                                self.epoch = self.epoch.max(epoch);
+                            if let Ok(change) = EpochChange::from_frame(&frame) {
+                                self.epoch = self.epoch.max(change.epoch);
                             }
                         }
                         applied += 1;

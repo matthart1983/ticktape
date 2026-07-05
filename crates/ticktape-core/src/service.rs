@@ -141,6 +141,14 @@ pub trait Service: Sized {
     /// of the deterministic inputs.
     type Config;
 
+    /// The application's input-schema version. A leader stamps it into the
+    /// `EpochChange` fence; a replica rejects a stream whose version differs
+    /// from its own (an explicit "schema mismatch" instead of a confusing
+    /// mid-replay decode error). Bump it whenever `Input`'s encoding changes
+    /// incompatibly. Defaults to `0` — services that never evolve their
+    /// schema, or don't replicate, can ignore it.
+    const SCHEMA_VERSION: u32 = 0;
+
     /// Construct empty initial state (seq 0, no inputs applied).
     fn genesis(config: &Self::Config) -> Self;
 
