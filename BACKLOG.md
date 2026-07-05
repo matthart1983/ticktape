@@ -269,41 +269,51 @@ to be verified on the Linux NUC.**
 
 ## P3 — polish, tooling, and honesty upkeep
 
-- **SBE codec adapter** (spec §6 tier 3) — practitioner platforms in this
-  space serialize with SBE; an adapter makes ticktape services interoperable
-  with that ecosystem without abandoning the canonical `fixed` tier.
-- **Transport is deliberately swappable** — practitioner consensus is that
-  the sequencer needs only plain UDP multicast or TCP (Aeron is "just
-  reliable A→B transport"), which is what M3 built. Keep `PacketSource`/
-  publisher seams clean so an Aeron-backed (or QUIC-backed) transport could
-  slot in for users who want it; owning the *journal*, by contrast, stays a
-  non-negotiable — an outsourced archive (Aeron Archiver) cannot be
-  fault-injected deterministically inside the simulator, and DST is the
-  moat.
-- **`WIRE.md`** — a standalone wire-format spec (frame, segment, snapshot,
-  packet, retransmit-request layouts + CRC rules, currently documented
-  only in Rust doc-comments). The wire is already language-neutral;
-  Coral's C++-node interop shows the value of making that a documented
-  feature so non-Rust nodes can join the stream.
-- **Schema-version handshake** — core publishes application/schema
-  definitions into the stream, making it self-describing. Cheap ticktape
-  version: a schema-version field in the stream's first frame (and in
-  `EpochChange`), so a replica rejects a mismatched `Input` schema
-  explicitly instead of failing on decode.
-- Simulator gaps: acceptor crash/restart faults (with persisted
-  `promised`), directory-entry loss on crash, non-prefix page flushes,
-  multi-node transport faults driven through the real `Reassembler`.
-- Derive macros: generic type support (removes the hand-written codecs in
-  `ticktape-gateway`).
-- Test the `UnixDatagram` packet source (implemented, unused by tests).
-- ~~Feed example: backfill late joiners from the journal across restarts~~
-  — **done in v0.8.0** (the feed leader runs on a repeater/rewinder chain).
-- `openraft` delegation backend behind a `raft-backend` feature (spec §9
-  open question — build only if someone actually wants it).
-- Docs: a short book / teaching deck (spec M6 item, deferred).
-- **Decisions pending**: crates.io publish (names unclaimed — cheap
-  insurance, do early) and the `v1.0.0` tag (recommend: after P0, which
-  is when "use this for something real" stops needing caveats).
+**Done in v0.18.0:**
+- **✅ `WIRE.md`** — standalone, language-neutral byte-level spec for every
+  persisted/transmitted structure (frame, segment, snapshot, packet,
+  retransmit request/reply, canonical value codec). A golden-offset test pins
+  the frame header to the doc so code and spec can't drift.
+- **✅ Schema-version handshake** — `Service::SCHEMA_VERSION` const; the leader
+  stamps it into the `EpochChange` fence (payload now `(epoch, first_seq,
+  schema_version)`, decoded tolerantly of the old 2-field form); a replica
+  rejects a fence whose version differs from its own with an explicit
+  `ReplicaError::SchemaMismatch` instead of a later decode error.
+- **✅ Derive-macro generic support** — the `#[derive(Encode, Decode)]` macros
+  now handle generic types (each type param bounded by the codec trait). The
+  four generic gateway envelopes + `RejectReason` dropped ~130 lines of manual
+  codecs for byte-identical derives (verified by the e2e wire suite). No
+  hand-written codecs remain in the tree.
+- **✅ Tested the `UnixDatagram` packet source** (was implemented, unexercised).
+
+**Not done — deferred with rationale:**
+- **SBE codec adapter** (spec §6 tier 3) — a *real* SBE adapter means matching
+  the SBE wire format + schema tooling for interop with existing SBE
+  ecosystems; that is a substantial feature, not polish. The canonical `fixed`
+  tier already covers in-house use. Deferred until an actual interop need.
+- **Transport swappable** — already satisfied: `PacketSource` / publisher are
+  clean seams (the new shm ring is proof — it slotted in as another
+  `PacketSource`). No work item; owning the journal stays non-negotiable (DST
+  moat).
+- **Simulator fault gaps** — assessed, low marginal value for *this* codebase:
+  *directory-entry loss* has no observable window (the journal and snapshot
+  store both `sync_dir` immediately after every file creation, and the sim only
+  crashes between operations); *non-prefix page flushes* are unrealistic for an
+  append-only, ordered-write log (prefix survival is the correct model, and a
+  hole would just read as CRC corruption). The genuinely-additive ones —
+  acceptor crash/restart inside the *multi-node* `cluster_sim`, and driving that
+  sim through the real `Reassembler` — are sizeable DST rewrites; the acceptor's
+  crash-safety is already covered by the 300-seed `acceptor_persistence.rs`.
+- **`openraft` delegation backend** — explicitly build-only-if-wanted (spec §9
+  open question). No demand yet.
+- **Docs: a short book / teaching deck** — deferred (docs, not code).
+
+**Decisions pending (yours):**
+- **crates.io publish** — names still unclaimed; cheap insurance, recommend
+  doing it early (netwatch's name was taken out from under it).
+- **`v1.0.0` tag** — P0, P1, and P2 are all complete and dual-platform verified
+  (macOS arm64 + Linux x86_64, io_uring on a real kernel); the "use this for
+  something real" caveats are largely gone. This is the natural moment.
 
 ---
 
