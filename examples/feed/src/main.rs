@@ -15,11 +15,12 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 use ticktape::{Node, NodeConfig, Seq, Service};
+use ticktape_journal::{JournalConfig, RealStorage};
 use ticktape_sim::demo::{gen_transfer, Bank};
 use ticktape_sim::{Invariants, Rng};
 use ticktape_transport::{
-    bind_udp, MemStore, Publisher, PublisherConfig, Receiver, ReceiverConfig, Replica,
-    Retransmitter,
+    bind_udp, ChainStore, JournalRewinder, MemStore, Publisher, PublisherConfig, Receiver,
+    ReceiverConfig, Replica, Retransmitter,
 };
 
 const SESSION: u64 = 0xF33D;
@@ -50,11 +51,22 @@ fn run_publisher(args: &[String]) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(7110);
 
-    let store = MemStore::new();
+    // Runs forever: snapshot + compaction bound disk, and the retransmitter
+    // is a repeater/rewinder chain — recent gap-fill from a bounded RAM
+    // window, historical (and post-restart late-join) ranges from the
+    // journal on disk. No unbounded store, no lost history across restarts.
+    let mut node_config = NodeConfig::new("feed-journal");
+    node_config.snapshot_every = Some(500);
+    let journal_config = JournalConfig::new("feed-journal");
+    let repeater = MemStore::with_capacity(64 * 1024);
+    let store = ChainStore {
+        primary: repeater.clone(),
+        secondary: JournalRewinder::new(journal_config, RealStorage),
+    };
     let (retransmitter, retx_addr) = Retransmitter::bind(
         format!("127.0.0.1:{retx_port}").parse().unwrap(),
         SESSION,
-        store.clone(),
+        store,
     )
     .expect("bind retransmitter");
     std::thread::spawn(move || retransmitter.serve_forever());
@@ -66,7 +78,7 @@ fn run_publisher(args: &[String]) {
     })
     .expect("publisher");
 
-    let mut node: Node<Bank> = Node::open(NodeConfig::new("feed-journal"), ()).expect("open node");
+    let mut node: Node<Bank> = Node::open(node_config, ()).expect("open node");
     let stream = node.subscribe();
     println!(
         "leader: recovered at seq {}, publishing to {dest_a}{}; retransmitter on {retx_addr}",
@@ -74,16 +86,11 @@ fn run_publisher(args: &[String]) {
         dest_b.map(|b| format!(" + {b}")).unwrap_or_default(),
     );
 
-    // Followers joining later than seq 1 need history: backfill the store
-    // with what the journal already holds by replaying our own stream.
-    // (M0 keeps recovered frames inside the node; the store learns only
-    // frames sequenced from now on, so start followers from this seq or
-    // wipe ./feed-journal for a fresh run.)
     let mut rng = Rng::new(0xF33D);
     loop {
         node.submit(gen_transfer(&mut rng)).expect("submit");
         for frame in stream.try_iter() {
-            store.record(frame.clone());
+            repeater.record(frame.clone());
             publisher.publish(&frame).expect("publish");
         }
         publisher.heartbeat().expect("heartbeat");

@@ -337,28 +337,37 @@ where
         ))));
     }
 
-    // Invariant 3: surviving frames are byte-exactly the submitted prefix.
-    let survivors = Journal::open_with(journal_config, storage.clone())
-        .map_err(|e| {
-            fail(InvariantViolation::new(format!(
-                "journal re-read failed: {e}"
-            )))
-        })?
-        .frames;
-    if survivors.len() != recovered {
-        return Err(fail(InvariantViolation::new(format!(
-            "node recovered seq {recovered} but journal holds {} frames",
-            survivors.len()
-        ))));
-    }
+    // Invariant 3: the journal holds a contiguous, byte-exact suffix of the
+    // submitted stream. With compaction (snapshot pruning bounds disk for
+    // 24×7 operation) the journal keeps only [first_seq..recovered]; the
+    // shadow `expected` still holds the full history, so we check the
+    // surviving tail against the corresponding slice.
+    let re = Journal::open_with(journal_config, storage.clone()).map_err(|e| {
+        fail(InvariantViolation::new(format!(
+            "journal re-read failed: {e}"
+        )))
+    })?;
+    let survivors = re.frames;
+    let first = re.first_seq.as_u64();
+    // The journal holds a contiguous run [first .. journal_last], each frame
+    // byte-matching the shadow. journal_last may be < recovered when a synced
+    // snapshot anchored the node beyond the journal tail (the crash lost the
+    // journal's unsynced tail but the snapshot file survived) — legitimate,
+    // and exercised here by compaction + retention.
     for (i, frame) in survivors.iter().enumerate() {
-        if frame.seq != Seq(i as u64 + 1) {
+        let seq = first + i as u64;
+        if frame.seq.0 != seq {
             return Err(fail(InvariantViolation::new(format!(
-                "total order broken: frame {i} has seq {}",
+                "total order broken: journal frame {i} has seq {} (expected {seq})",
                 frame.seq
             ))));
         }
-        let matches = match &expected[i] {
+        if seq > recovered as u64 {
+            return Err(fail(InvariantViolation::new(format!(
+                "journal frame at seq {seq} exceeds recovered tip {recovered}"
+            ))));
+        }
+        let matches = match &expected[seq as usize - 1] {
             Expected::Input(bytes) => frame.kind == FrameKind::Input && &frame.payload == bytes,
             Expected::Tick => frame.kind == FrameKind::Tick,
             Expected::Mark => frame.kind == FrameKind::SnapshotMark,
@@ -370,25 +379,45 @@ where
             ))));
         }
     }
+    // If the recovered tip is beyond the journal, a snapshot must have
+    // anchored it — otherwise state was fabricated from nowhere.
+    let journal_last = survivors
+        .last()
+        .map_or(first.saturating_sub(1), |f| f.seq.0);
+    if recovered as u64 > journal_last {
+        match node.recovery_info().snapshot_seq {
+            Some(s) if s.0 >= journal_last => {}
+            other => {
+                return Err(fail(InvariantViolation::new(format!(
+                    "recovered tip {recovered} exceeds journal_last {journal_last}                      with no anchoring snapshot (recovery snapshot_seq {other:?})"
+                ))));
+            }
+        }
+    }
     // The lost tail is permanently gone; it is no longer expected.
     expected.truncate(recovered);
     // Everything that survived a power loss is durable by definition.
     *synced = recovered;
 
-    // Invariant 4: determinism — an independent replay of the surviving
-    // frames must byte-match the recovered node's state.
+    // Invariant 4: determinism — an independent replay of the *full* history
+    // (from the shadow, which compaction never touches) must byte-match the
+    // recovered node's state. Stronger than replaying the journal: it proves
+    // snapshot+tail recovery equals a genesis replay, even when the journal
+    // no longer holds genesis. (Replay uses zero sequenced time; the sim
+    // services here are time-independent, and the time-dependent replay path
+    // is covered by the runtime's real-timestamp recovery tests.)
     let mut fresh = S::genesis(service_config);
     let mut outputs = OutBuf::new();
-    for frame in &survivors {
-        if frame.kind == FrameKind::Input {
-            let input: S::Input = decode_all(&frame.payload).map_err(|e| {
+    for (i, exp) in expected.iter().enumerate() {
+        if let Expected::Input(bytes) = exp {
+            let seq = Seq(i as u64 + 1);
+            let input: S::Input = decode_all(bytes).map_err(|e| {
                 fail(InvariantViolation::new(format!(
-                    "journaled input no longer decodes at seq {}: {e}",
-                    frame.seq
+                    "shadow input no longer decodes at seq {seq}: {e}"
                 )))
             })?;
-            let mut ctx = Ctx::new(frame.seq, frame.timestamp, &mut outputs);
-            fresh.apply(frame.seq, &input, &mut ctx);
+            let mut ctx = Ctx::new(seq, Timestamp::ZERO, &mut outputs);
+            fresh.apply(seq, &input, &mut ctx);
             outputs.drain();
         }
     }

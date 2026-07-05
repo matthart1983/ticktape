@@ -4,6 +4,7 @@
 use crate::reassembler::Reassembler;
 use crate::wire::{Packet, RetransmitRequest, MAX_PACKET_BYTES, REQUEST_LEN};
 use crate::TransportError;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::net::UnixDatagram;
@@ -249,56 +250,182 @@ impl<Src: PacketSource> Receiver<Src> {
     }
 }
 
-/// In-memory frame store feeding the retransmitter. Frame at seq `k` lives
-/// at index `k-1`; the publisher records every frame it sends.
-#[derive(Clone, Default)]
+/// Anything that can serve historical frames by seq range for gap-fill.
+///
+/// The retransmit path has two natural implementations (the
+/// jimgreco/core `MoldRepeater`/`MoldRewinder` split): a bounded in-memory
+/// [`MemStore`] **repeater** for live recent-window gap-fill, and a
+/// journal-backed [`JournalRewinder`] for historical ranges that have
+/// aged out of the window. [`ChainStore`] tries one then the other, so a
+/// long-running feed serves recent gaps from RAM and old gaps from disk
+/// without ever holding unbounded history in memory.
+pub trait FrameStore: Send + Sync {
+    /// Up to `count` frames starting at `from`, in seq order. May return
+    /// fewer (or none) if this store doesn't hold that range.
+    fn range(&self, from: Seq, count: usize) -> Vec<Frame>;
+    /// Highest seq this store can serve (`Seq::GENESIS` if empty).
+    fn high_water(&self) -> Seq;
+    /// Lowest seq this store can serve (`Seq(1)` for a full store; higher
+    /// for a bounded window or a compacted journal).
+    fn low_water(&self) -> Seq;
+}
+
+/// Bounded in-memory recent-window store — the **repeater**. Retains at
+/// most `capacity` most-recent frames; older frames age out (they are
+/// served from a [`JournalRewinder`] instead). This is the bound that
+/// makes 24×7 operation possible — the old unbounded `Vec` leaked the
+/// entire feed history.
+#[derive(Clone)]
 pub struct MemStore {
-    frames: Arc<RwLock<Vec<Frame>>>,
+    frames: Arc<RwLock<VecDeque<Frame>>>,
+    capacity: usize,
 }
 
 impl MemStore {
+    /// A store retaining the most recent `capacity` frames.
+    pub fn with_capacity(capacity: usize) -> Self {
+        MemStore {
+            frames: Arc::new(RwLock::new(VecDeque::new())),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Default recent window (256k frames).
     pub fn new() -> Self {
-        Self::default()
+        Self::with_capacity(256 * 1024)
     }
 
     /// Record a frame (must be seq-contiguous with what's stored).
     pub fn record(&self, frame: Frame) {
         let mut frames = self.frames.write().unwrap();
-        debug_assert_eq!(frame.seq.0, frames.len() as u64 + 1, "gapless store");
-        frames.push(frame);
-    }
-
-    pub fn range(&self, from: Seq, count: usize) -> Vec<Frame> {
-        let frames = self.frames.read().unwrap();
-        if from.0 == 0 {
-            return Vec::new();
+        debug_assert!(
+            frames
+                .back()
+                .is_none_or(|last| frame.seq.0 == last.seq.0 + 1),
+            "gapless store"
+        );
+        frames.push_back(frame);
+        while frames.len() > self.capacity {
+            frames.pop_front();
         }
-        let start = (from.0 - 1) as usize;
-        frames
-            .get(start..frames.len().min(start + count))
-            .map(<[Frame]>::to_vec)
-            .unwrap_or_default()
-    }
-
-    pub fn high_water(&self) -> Seq {
-        Seq(self.frames.read().unwrap().len() as u64)
     }
 }
 
-/// Serves retransmit range requests over TCP from a [`MemStore`].
-pub struct Retransmitter {
+impl Default for MemStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameStore for MemStore {
+    fn range(&self, from: Seq, count: usize) -> Vec<Frame> {
+        let frames = self.frames.read().unwrap();
+        let Some(base) = frames.front().map(|f| f.seq.0) else {
+            return Vec::new();
+        };
+        if from.0 < base {
+            return Vec::new(); // aged out of the window
+        }
+        let start = (from.0 - base) as usize;
+        frames.iter().skip(start).take(count).cloned().collect()
+    }
+
+    fn high_water(&self) -> Seq {
+        Seq(self.frames.read().unwrap().back().map_or(0, |f| f.seq.0))
+    }
+
+    fn low_water(&self) -> Seq {
+        Seq(self.frames.read().unwrap().front().map_or(1, |f| f.seq.0))
+    }
+}
+
+/// Journal-backed historical store — the **rewinder**. Serves ranges by
+/// re-reading the journal on demand, so late joiners and old gap-fills
+/// cost disk reads, not RAM. Bounded from below by journal compaction
+/// (post-compaction it serves snapshot-tail onward).
+#[derive(Clone)]
+pub struct JournalRewinder<St: ticktape_journal::Storage + Clone> {
+    config: ticktape_journal::JournalConfig,
+    storage: St,
+}
+
+impl<St: ticktape_journal::Storage + Clone> JournalRewinder<St> {
+    pub fn new(config: ticktape_journal::JournalConfig, storage: St) -> Self {
+        JournalRewinder { config, storage }
+    }
+
+    fn recovered(&self) -> Option<ticktape_journal::Recovered<St>> {
+        ticktape_journal::Journal::open_with(self.config.clone(), self.storage.clone()).ok()
+    }
+}
+
+impl<St: ticktape_journal::Storage + Clone + Send + Sync + 'static> FrameStore
+    for JournalRewinder<St>
+{
+    fn range(&self, from: Seq, count: usize) -> Vec<Frame> {
+        let Some(rec) = self.recovered() else {
+            return Vec::new();
+        };
+        rec.frames
+            .into_iter()
+            .filter(|f| f.seq >= from)
+            .take(count)
+            .collect()
+    }
+
+    fn high_water(&self) -> Seq {
+        self.recovered()
+            .map_or(Seq::GENESIS, |r| r.journal.last_seq())
+    }
+
+    fn low_water(&self) -> Seq {
+        self.recovered().map_or(Seq(1), |r| r.first_seq)
+    }
+}
+
+/// Try `primary` (the repeater), fall back to `secondary` (the rewinder)
+/// for ranges the repeater has aged out. The whole point of the split.
+#[derive(Clone)]
+pub struct ChainStore<A, B> {
+    pub primary: A,
+    pub secondary: B,
+}
+
+impl<A: FrameStore, B: FrameStore> FrameStore for ChainStore<A, B> {
+    fn range(&self, from: Seq, count: usize) -> Vec<Frame> {
+        let primary = self.primary.range(from, count);
+        // Use the repeater only if it actually covers `from`; otherwise the
+        // range starts before its window and the rewinder must serve it.
+        if primary.first().map(|f| f.seq) == Some(from) {
+            primary
+        } else {
+            self.secondary.range(from, count)
+        }
+    }
+
+    fn high_water(&self) -> Seq {
+        self.primary.high_water().max(self.secondary.high_water())
+    }
+
+    fn low_water(&self) -> Seq {
+        self.primary.low_water().min(self.secondary.low_water())
+    }
+}
+
+/// Serves retransmit range requests over TCP from any [`FrameStore`].
+pub struct Retransmitter<S: FrameStore = MemStore> {
     listener: TcpListener,
-    store: MemStore,
+    store: S,
     session: u64,
 }
 
-impl Retransmitter {
+impl<S: FrameStore> Retransmitter<S> {
     /// Bind and return the actual bound address (use port 0 to auto-pick).
     pub fn bind(
         addr: SocketAddr,
         session: u64,
-        store: MemStore,
-    ) -> std::io::Result<(Retransmitter, SocketAddr)> {
+        store: S,
+    ) -> std::io::Result<(Retransmitter<S>, SocketAddr)> {
         let listener = TcpListener::bind(addr)?;
         let local = listener.local_addr()?;
         Ok((
@@ -313,7 +440,10 @@ impl Retransmitter {
 
     /// Serve requests forever (run on its own thread). Malformed requests
     /// drop the connection; the caller's gap simply stays unfilled.
-    pub fn serve_forever(self) {
+    pub fn serve_forever(self)
+    where
+        S: 'static,
+    {
         for stream in self.listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let _ = self.serve_one(&mut stream);

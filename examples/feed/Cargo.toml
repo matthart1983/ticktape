@@ -10,3 +10,4 @@ publish = false
 ticktape.workspace = true
 ticktape-sim.workspace = true
 ticktape-transport.workspace = true
+ticktape-journal.workspace = true

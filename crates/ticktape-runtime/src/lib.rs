@@ -73,6 +73,14 @@ pub enum NodeError {
         seq: Seq,
         err: ticktape_core::CodecError,
     },
+    /// The journal was compacted (history starts at `journal_first`) but no
+    /// usable snapshot covers the seqs before it, so state cannot be
+    /// rebuilt. Means every retained snapshot was lost or corrupt — a
+    /// genuine data-loss situation, surfaced rather than silently starting
+    /// from a partial prefix.
+    UncoveredHistory {
+        journal_first: Seq,
+    },
 }
 
 impl fmt::Display for NodeError {
@@ -82,6 +90,10 @@ impl fmt::Display for NodeError {
             NodeError::CorruptInput { seq, err } => {
                 write!(f, "journaled input at seq {seq} failed to decode: {err}")
             }
+            NodeError::UncoveredHistory { journal_first } => write!(
+                f,
+                "journal compacted to seq {journal_first} but no snapshot covers earlier history"
+            ),
         }
     }
 }
@@ -103,6 +115,13 @@ pub struct NodeConfig {
     /// then always replays from genesis). Snapshots live next to the
     /// journal segments as `.snap` files.
     pub snapshot_every: Option<u64>,
+    /// How many recent snapshots to retain after each new one is written;
+    /// older snapshots are pruned and the journal is compacted below the
+    /// oldest kept snapshot. `1` bounds disk most aggressively; a small N
+    /// (default 2) keeps a corrupt-snapshot fallback. This is what makes
+    /// 24×7 operation possible — without it, disk grows without bound.
+    /// Ignored when `snapshot_every` is `None`.
+    pub retain_snapshots: usize,
 }
 
 impl NodeConfig {
@@ -111,6 +130,7 @@ impl NodeConfig {
             journal: JournalConfig::new(journal_dir),
             stream_id: 1,
             snapshot_every: None,
+            retain_snapshots: 2,
         }
     }
 }
@@ -162,6 +182,7 @@ pub struct Node<S: Service, T: TimeSource = WallClock, St: Storage + Clone = Rea
     journal: Journal<St>,
     snapshots: SnapshotStore<St>,
     snapshot_every: Option<u64>,
+    retain_snapshots: usize,
     clock: T,
     stream_id: u16,
     seq: Seq,
@@ -202,26 +223,53 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         let journal_config = config.journal.clone();
         let recovered = Journal::open_with(config.journal, storage.clone())?;
         let snapshots = SnapshotStore::new(journal_config.dir.clone(), storage.clone());
+        let journal_last = recovered.journal.last_seq();
+        let journal_first = recovered.first_seq;
 
-        // A crash that truncated the journal invalidates any snapshot taken
-        // past the surviving tail — that history no longer exists. Purge
-        // them before trusting anything.
-        snapshots.purge_after(recovered.journal.last_seq())?;
-
-        // Fast recovery: restore the newest valid snapshot at or before the
-        // journal tail, then replay only the frames after it. A snapshot
-        // whose payload no longer decodes is treated like a corrupt one:
-        // fall back to full replay (snapshots are never the record).
+        // Choose the recovery anchor: the newest *valid* snapshot whose seq
+        // is >= (journal_first - 1) — i.e. one the surviving journal can
+        // continue from. A crash can leave a synced snapshot at a seq the
+        // journal (which loses its unsynced tail) no longer reaches; that
+        // snapshot is durable state, not stale, and is the anchor a
+        // compacted journal depends on. Corrupt snapshots are skipped in
+        // favor of an older retained one. Consider snapshots above the
+        // journal tail too (bounded scan — retention keeps only a few).
+        let scan_ceiling = Seq(journal_last.0.max(snapshots.high_water_seq()?.0));
         let mut from_seq = Seq::GENESIS;
         let mut service = None;
-        if let Some(snap) = snapshots.load_latest(recovered.journal.last_seq())? {
+        for snap in snapshots.load_candidates(scan_ceiling)? {
+            if snap.seq.0 + 1 < journal_first.0 {
+                continue; // older than the journal floor — leaves a gap
+            }
             if let Ok(decoded) = decode_all::<S::Snapshot>(&snap.payload) {
                 service = Some(S::restore(decoded, &service_config));
                 from_seq = snap.seq;
+                break;
             }
+        }
+        // If the journal was compacted, a covering snapshot is mandatory —
+        // there is no genesis to replay from.
+        if service.is_none() && journal_first > Seq::GENESIS.next() {
+            return Err(NodeError::UncoveredHistory { journal_first });
         }
         let snapshot_seq = (from_seq > Seq::GENESIS).then_some(from_seq);
         let mut service = service.unwrap_or_else(|| S::genesis(&service_config));
+
+        // The recovered tip is the later of the journal tail and the anchor
+        // snapshot; resume writing above it so no fork forms below the
+        // snapshot. Now purge snapshots strictly above the tip — those are
+        // the genuinely-future/forkable ones (the M2 stale-snapshot fix);
+        // the anchor and everything at/below the tip are retained.
+        let recovered_tip = Seq(journal_last.0.max(from_seq.0));
+        snapshots.purge_after(recovered_tip)?;
+
+        // If the anchor snapshot is beyond the journal's surviving tail,
+        // the journal can't be appended to at tip+1 without a gap — reseat
+        // it to a fresh segment at tip+1 (the snapshot covers the hole).
+        let mut recovered = recovered;
+        if from_seq > journal_last {
+            recovered.journal.reseat_to(recovered_tip.next())?;
+        }
 
         let mut outputs = OutBuf::new();
         let mut last_timestamp = Timestamp::ZERO;
@@ -247,7 +295,7 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
             }
         }
 
-        let seq = recovered.journal.last_seq();
+        let seq = recovered_tip;
         Ok(Node {
             service,
             service_config,
@@ -256,6 +304,7 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
             journal: recovered.journal,
             snapshots,
             snapshot_every: config.snapshot_every,
+            retain_snapshots: config.retain_snapshots,
             clock,
             stream_id: config.stream_id,
             seq,
@@ -308,6 +357,17 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         self.snapshots.write(seq, 0, &payload)?;
         let mark = self.sequence(FrameKind::SnapshotMark, encode_to_vec(&seq))?;
         self.bus.publish(&mark);
+
+        // Bound disk: prune to the newest N snapshots, then compact the
+        // journal below the oldest one still kept (so its tail survives).
+        // This is the 24×7 loop — steady-state disk, no day-roll.
+        if let Some(oldest_kept) = self.snapshots.prune_keep_newest(self.retain_snapshots)? {
+            // Compact below oldest_kept - 1: the kept snapshot needs frames
+            // strictly after its seq, so keep seq..; frames <= oldest_kept-1
+            // are covered by the snapshot and unreachable.
+            let cutoff = Seq(oldest_kept.0.saturating_sub(1));
+            self.journal.compact_below(cutoff)?;
+        }
         Ok(())
     }
 

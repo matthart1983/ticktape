@@ -55,6 +55,7 @@ name = "feed"
 version = "0.7.0"
 dependencies = [
  "ticktape",
+ "ticktape-journal",
  "ticktape-sim",
  "ticktape-transport",
 ]

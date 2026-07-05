@@ -35,8 +35,8 @@ pub mod replica;
 pub mod wire;
 
 pub use net::{
-    bind_udp, spawn_feed, MemStore, PacketSource, Publisher, PublisherConfig, Receiver,
-    ReceiverConfig, Retransmitter,
+    bind_udp, spawn_feed, ChainStore, FrameStore, JournalRewinder, MemStore, PacketSource,
+    Publisher, PublisherConfig, Receiver, ReceiverConfig, Retransmitter,
 };
 pub use reassembler::Reassembler;
 pub use replica::Replica;

@@ -134,6 +134,77 @@ impl<St: Storage> SnapshotStore<St> {
         Ok(())
     }
 
+    /// Highest seq of any snapshot file on disk (validity not checked;
+    /// used only to widen the recovery scan ceiling). `Seq::GENESIS` if none.
+    pub fn high_water_seq(&self) -> Result<Seq, JournalError> {
+        let hi = self
+            .storage
+            .list_dir(&self.dir)?
+            .into_iter()
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("snap"))
+            .filter_map(|p| p.file_stem()?.to_str()?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        Ok(Seq(hi))
+    }
+
+    /// Validated snapshots with `seq <= max_seq`, newest first. Used by
+    /// recovery to fall back to an older snapshot if the newest fails to
+    /// decode against the current `Service::Snapshot` schema.
+    pub fn load_candidates(&self, max_seq: Seq) -> Result<Vec<LoadedSnapshot>, JournalError> {
+        let mut paths: Vec<PathBuf> = self
+            .storage
+            .list_dir(&self.dir)?
+            .into_iter()
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("snap"))
+            .collect();
+        paths.sort();
+        let mut out = Vec::new();
+        for path in paths.iter().rev() {
+            if let Ok(bytes) = self.storage.read(path) {
+                if let Some(snap) = parse_snapshot(&bytes) {
+                    if snap.seq <= max_seq {
+                        out.push(snap);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Prune to the newest `keep` valid snapshots, deleting older ones.
+    /// Returns the seq of the *oldest retained* snapshot (or `None` if
+    /// nothing was kept / nothing exists) — that seq is the safe
+    /// compaction cutoff: journal history before it is still needed by a
+    /// retained snapshot in case the newest is later found corrupt.
+    ///
+    /// Keeping N>1 is the corrupt-snapshot safety net: recovery falls back
+    /// to an older snapshot (and the journal tail it needs) if the newest
+    /// fails validation, so never compact below the oldest *kept* one.
+    pub fn prune_keep_newest(&self, keep: usize) -> Result<Option<Seq>, JournalError> {
+        let keep = keep.max(1);
+        let mut entries: Vec<(u64, PathBuf)> = self
+            .storage
+            .list_dir(&self.dir)?
+            .into_iter()
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("snap"))
+            .filter_map(|p| {
+                let seq = p.file_stem()?.to_str()?.parse::<u64>().ok()?;
+                Some((seq, p))
+            })
+            .collect();
+        entries.sort_by_key(|(seq, _)| *seq);
+        if entries.len() > keep {
+            let cut = entries.len() - keep;
+            for (_, path) in &entries[..cut] {
+                self.storage.remove(path)?;
+            }
+            self.storage.sync_dir(&self.dir)?;
+            return Ok(entries.get(cut).map(|(seq, _)| Seq(*seq)));
+        }
+        Ok(entries.first().map(|(seq, _)| Seq(*seq)))
+    }
+
     fn path_for(&self, seq: Seq) -> PathBuf {
         self.dir.join(format!("{:020}.snap", seq.0))
     }

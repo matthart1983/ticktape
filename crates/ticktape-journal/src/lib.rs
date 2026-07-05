@@ -152,6 +152,10 @@ pub struct Recovered<St: Storage = RealStorage> {
     /// All journaled frames in seq order. (M0 materializes them; a
     /// streaming replay iterator is planned once volumes demand it.)
     pub frames: Vec<Frame>,
+    /// The seq of the first frame the journal holds. `Seq(1)` for an
+    /// uncompacted journal; greater after compaction — the caller must
+    /// have a snapshot covering everything before it.
+    pub first_seq: Seq,
     /// Whether a torn tail was detected and truncated during recovery.
     pub truncated_torn_tail: bool,
 }
@@ -186,6 +190,12 @@ impl<St: Storage> Journal<St> {
     /// replaying every segment. A torn tail in the final segment is
     /// truncated to the last intact frame; corruption anywhere else is an
     /// error.
+    ///
+    /// A compacted journal (segments pruned below a snapshot) starts at
+    /// some seq k > 1; the stream is validated gapless from the first
+    /// *remaining* segment. Whether history before k is covered by a
+    /// snapshot is the caller's responsibility ([`Recovered::first_seq`]
+    /// says where the journal starts).
     pub fn open_with(config: JournalConfig, storage: St) -> Result<Recovered<St>, JournalError> {
         storage.create_dir_all(&config.dir)?;
 
@@ -205,6 +215,11 @@ impl<St: Storage> Journal<St> {
             let is_last = i == segment_paths.len() - 1;
             let bytes = storage.read(path)?;
             let header = parse_segment_header(path, &bytes)?;
+            if i == 0 {
+                // Compaction may have removed leading segments; the
+                // journal's history now starts wherever this one does.
+                expected_next = header.first_seq;
+            }
             if header.first_seq != expected_next {
                 return Err(JournalError::NonContiguousSeq {
                     segment: path.clone(),
@@ -250,7 +265,13 @@ impl<St: Storage> Journal<St> {
             }
         }
 
-        let last_seq = Seq(expected_next.0 - 1);
+        let last_seq = Seq(expected_next.0.saturating_sub(1));
+        let first_seq = match frames.first() {
+            Some(frame) => frame.seq,
+            // Empty journal (no segments, or a single frameless segment):
+            // history "starts" at whatever would come next.
+            None => Seq(last_seq.0 + 1),
+        };
 
         // Re-open the final segment for appending, if any.
         let current = match segment_paths.last() {
@@ -277,8 +298,85 @@ impl<St: Storage> Journal<St> {
                 dirty: false,
             },
             frames,
+            first_seq,
             truncated_torn_tail: truncated,
         })
+    }
+
+    /// Compaction: delete every segment whose frames all have
+    /// `seq <= cutoff` (typically the oldest *retained* snapshot's seq, so
+    /// every remaining snapshot still has the journal tail it needs). The
+    /// active (last) segment is never deleted. Returns the number of
+    /// segments removed.
+    ///
+    /// This is what bounds disk for 24×7 operation: snapshot, prune old
+    /// snapshots, then compact below the oldest kept one.
+    pub fn compact_below(&mut self, cutoff: Seq) -> Result<u64, JournalError> {
+        let mut segment_paths: Vec<PathBuf> = self
+            .storage
+            .list_dir(&self.config.dir)?
+            .into_iter()
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("seg"))
+            .collect();
+        segment_paths.sort();
+        if segment_paths.len() <= 1 {
+            return Ok(0);
+        }
+        // Segments are named by their first seq; segment i holds seqs
+        // [first[i], first[i+1]) — deletable iff first[i+1] <= cutoff + 1.
+        let firsts: Vec<u64> = segment_paths
+            .iter()
+            .map(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| stem.parse::<u64>().ok())
+                    .ok_or_else(|| JournalError::BadSegmentHeader {
+                        segment: path.clone(),
+                        reason: "segment filename is not a seq".to_string(),
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let mut removed = 0u64;
+        for i in 0..segment_paths.len() - 1 {
+            if firsts[i + 1] <= cutoff.0 + 1 {
+                self.storage.remove(&segment_paths[i])?;
+                removed += 1;
+            } else {
+                break;
+            }
+        }
+        if removed > 0 {
+            self.storage.sync_dir(&self.config.dir)?;
+        }
+        Ok(removed)
+    }
+
+    /// Reseat the journal to resume appending at `next_seq`, dropping all
+    /// segments below it. Used when recovery anchors on a snapshot whose
+    /// seq is beyond the journal's surviving tail (a synced snapshot can
+    /// outlive the journal's unsynced tail under lazy fsync): the frames
+    /// between the journal tail and the snapshot are gone but the snapshot
+    /// *is* the state, so we start a fresh gapless segment at `next_seq`
+    /// and let the snapshot cover everything before it.
+    pub fn reseat_to(&mut self, next_seq: Seq) -> Result<(), JournalError> {
+        debug_assert!(next_seq.0 >= 1);
+        self.sync()?;
+        // Roll a new active segment starting at next_seq.
+        let path = self.config.dir.join(format!("{:020}.seg", next_seq.0));
+        let mut file = self.storage.create_new(&path)?;
+        file.write_all(&segment_header_bytes(next_seq, self.epoch))?;
+        file.sync_data()?;
+        self.storage.sync_dir(&self.config.dir)?;
+        self.current = Some(OpenSegment {
+            file,
+            size: SEGMENT_HEADER_LEN as u64,
+            frames: 0,
+        });
+        self.last_seq = Seq(next_seq.0 - 1);
+        // Every older segment is now non-active and entirely below the
+        // reseat point; drop them so the journal stays gapless.
+        self.compact_below(Seq(next_seq.0 - 1))?;
+        Ok(())
     }
 
     /// The seq of the last durably-loggable frame ([`Seq::GENESIS`] if empty).

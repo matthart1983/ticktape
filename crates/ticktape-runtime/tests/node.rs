@@ -279,3 +279,65 @@ fn snapshot_marks_appear_in_the_stream() {
     let mut node = node;
     assert!(node.verify_replay().unwrap());
 }
+
+#[test]
+fn compaction_bounds_disk_over_long_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = snap_config(dir.path(), 20);
+    config.retain_snapshots = 2;
+    let seg_count = |dir: &std::path::Path, ext: &str| {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    == Some(ext)
+            })
+            .count()
+    };
+    {
+        let mut node: Node<Meter, _> =
+            Node::open_with_clock(config.clone(), (), ManualClock(Timestamp(1))).unwrap();
+        for i in 1..=2000 {
+            node.submit(Cmd::Bump(i)).unwrap();
+        }
+        // Many snapshots taken, but retention + compaction bound both.
+        assert!(seg_count(dir.path(), "snap") <= 2, "snapshots not pruned");
+        assert!(
+            seg_count(dir.path(), "seg") <= 4,
+            "journal not compacted: {} segments",
+            seg_count(dir.path(), "seg")
+        );
+    }
+    // And it still recovers to exact state after all that pruning.
+    let node: Node<Meter, _> =
+        Node::open_with_clock(config, (), ManualClock(Timestamp(9))).unwrap();
+    // State is exact after all the pruning; seq is inputs + interleaved marks.
+    assert_eq!(node.service().total, (1..=2000).sum::<i64>());
+    assert!(node.seq().as_u64() >= 2000);
+    assert!(node.recovery_info().snapshot_seq.is_some());
+}
+
+#[test]
+fn recovery_from_compacted_journal_needs_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = snap_config(dir.path(), 10);
+    config.retain_snapshots = 1;
+    {
+        let mut node: Node<Meter, _> =
+            Node::open_with_clock(config.clone(), (), ManualClock(Timestamp(1))).unwrap();
+        for i in 1..=100 {
+            node.submit(Cmd::Bump(i)).unwrap();
+        }
+    }
+    // Genesis segment is gone (compacted); recovery must lean on a snapshot.
+    let node: Node<Meter, _> =
+        Node::open_with_clock(config, (), ManualClock(Timestamp(9))).unwrap();
+    assert_eq!(node.service().total, (1..=100).sum::<i64>());
+    let info = node.recovery_info();
+    assert!(info.snapshot_seq.unwrap().as_u64() >= 90);
+    assert!(info.inputs_replayed <= 20, "replayed too much: {info:?}");
+}
