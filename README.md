@@ -364,8 +364,9 @@ workstream has landed — group commit, hardware CRC32C, packet batching,
 streaming replay, plus feature-gated `io_uring` (Linux) and shared-memory
 ring backends.
 Operators get a Prometheus `/metrics` endpoint per server (role, replication
-lag, snapshot seq, disk) to watch a deployment and drive failover. The API
-will still move.
+lag, snapshot seq, disk) to watch a deployment and drive failover. As of
+**1.0.0** the public API follows semver; the wire format is documented in
+[WIRE.md](WIRE.md).
 
 | Milestone | Scope | Status |
 |---|---|---|
