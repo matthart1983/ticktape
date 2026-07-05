@@ -96,20 +96,18 @@ cluster sim's invariants hold on the real deployment's journals.
 
 ## P1 — correctness traps and product machinery
 
-### 1. Admin/observability plane
-ticktape components expose nothing — not even counters. Both reviewed
-systems treat operability as a product feature, and the practitioner
-called it out specifically: core lets you telnet into any service node
-for an interactive shell — inspect state, submit commands, JMX-style —
-plus a web console. Minimal version first: a stats struct per component
-(sequencer seq + commit watermark, journal bytes + segment count, snapshot
-age, session count + per-session seqs, retransmit window depth, gap-fill
-counts) surfaced by the packaged server on one plain-text/HTTP endpoint.
-An interactive admin channel (pause / promote / snapshot-now / prune) is
-the natural second step and shares plumbing with the no-SPOF server's Stage-A manual
-promotion.
-**Done means:** an operator can answer "is it healthy, how far behind is
-the standby, when was the last snapshot" with curl, no debugger.
+### ✅ 1. Admin/observability plane — DONE (v0.11.0)
+`ticktape-server::admin` — `ServerStats` (role, epoch, seq, replication
+lag, latest snapshot seq, journal segment count) + a dependency-free
+Prometheus-text HTTP endpoint (`/metrics`, `/healthz`); `Server::stats()`
+gathers it cheaply. An operator can answer "is it healthy, which node
+leads, how far behind is each standby, is disk bounded" with curl, and it
+updates live across a failover. **Remaining as a follow-up:** an
+*interactive* admin channel (pause / promote / snapshot-now / prune over a
+socket — core's telnet-shell affordance); the read-only metrics plane was
+the higher-value half and shipped first. Not yet surfaced: per-session
+gateway stats + commit watermark (the packaged server doesn't host the
+gateway yet).
 
 ### 2. Events to offline sessions are silently dropped
 `gateway::server` routes an `Addressed` event only to live sinks; a client
