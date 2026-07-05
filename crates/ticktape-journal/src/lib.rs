@@ -384,6 +384,20 @@ impl<St: Storage> Journal<St> {
         self.last_seq
     }
 
+    /// Number of segment files on disk — a cheap disk-pressure gauge for
+    /// operators (bounded under compaction; unbounded without it).
+    pub fn segment_count(&self) -> usize {
+        self.storage
+            .list_dir(&self.config.dir)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("seg"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// Append one frame. `frame.seq` must be exactly `last_seq + 1`.
     pub fn append(&mut self, frame: &Frame) -> Result<(), JournalError> {
         let expected = self.last_seq.next();

@@ -45,7 +45,9 @@ use ticktape_transport::{
     ReceiverConfig, Replica, Retransmitter,
 };
 
+pub mod admin;
 pub mod config;
+pub use admin::{bind_metrics, serve_metrics, ServerStats};
 pub use config::{ClusterConfig, PeerAddrs};
 
 /// Errors from server operations.
@@ -253,6 +255,41 @@ where
             Mode::Leader(l) => l.node.seq(),
             Mode::Follower(f) => f.applied,
             Mode::Transitioning => Seq::GENESIS,
+        }
+    }
+
+    /// A point-in-time [`ServerStats`] for the admin/metrics endpoint —
+    /// cheap to gather (no journal scan beyond a directory listing).
+    pub fn stats(&self) -> ServerStats {
+        let (role, seq, lag, snapshot_seq, journal_segments) = match &self.mode {
+            Mode::Leader(l) => (
+                "leader",
+                l.node.seq().0,
+                0,
+                l.node.latest_snapshot_seq().map_or(0, |s| s.0),
+                l.node.journal_segments() as u64,
+            ),
+            Mode::Follower(f) => {
+                let high = f.receiver.announced_high_water().0;
+                let lag = high.saturating_sub(f.applied.0);
+                (
+                    "follower",
+                    f.applied.0,
+                    lag,
+                    0,
+                    f.journal.segment_count() as u64,
+                )
+            }
+            Mode::Transitioning => ("follower", 0, 0, 0, 0),
+        };
+        ServerStats {
+            node: self.idx,
+            role,
+            epoch: self.epoch,
+            seq,
+            lag,
+            snapshot_seq,
+            journal_segments,
         }
     }
 

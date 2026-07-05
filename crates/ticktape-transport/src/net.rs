@@ -207,6 +207,12 @@ impl<Src: PacketSource> Receiver<Src> {
         self.config.retransmitter = addr;
     }
 
+    /// Highest seq the upstream leader has announced (via data/heartbeats) —
+    /// the numerator for a follower's replication lag.
+    pub fn announced_high_water(&self) -> Seq {
+        self.reassembler.announced_high_water()
+    }
+
     fn fill_gap(&mut self, from: Seq, count: u64) -> Result<(), TransportError> {
         let Some(addr) = self.config.retransmitter else {
             return Err(TransportError::GapUnrecoverable {

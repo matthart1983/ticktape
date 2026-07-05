@@ -421,6 +421,22 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         self.recovery
     }
 
+    /// Number of journal segment files (disk-pressure gauge; bounded by
+    /// compaction under 24×7 operation).
+    pub fn journal_segments(&self) -> usize {
+        self.journal.segment_count()
+    }
+
+    /// The seq of the most recent durable snapshot, if any (from recovery
+    /// or a snapshot taken since). Cheap: reads the snapshot store's
+    /// high-water filename.
+    pub fn latest_snapshot_seq(&self) -> Option<Seq> {
+        match self.snapshots.high_water_seq() {
+            Ok(seq) if seq > Seq::GENESIS => Some(seq),
+            _ => None,
+        }
+    }
+
     /// Force the journal to stable storage (e.g. before a deliberate
     /// shutdown under `FsyncPolicy::Micros`).
     pub fn sync(&mut self) -> Result<(), NodeError> {

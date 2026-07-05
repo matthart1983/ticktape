@@ -58,6 +58,12 @@ impl Reassembler {
         Seq(self.next)
     }
 
+    /// Highest seq known to exist upstream (from data + heartbeats). A
+    /// follower's lag is `announced_high_water - (next_expected - 1)`.
+    pub fn announced_high_water(&self) -> Seq {
+        Seq(self.announced_next.saturating_sub(1))
+    }
+
     /// Feed one packet (from either feed channel, or a retransmit reply).
     pub fn ingest(&mut self, packet: Packet) -> Result<(), TransportError> {
         match self.session {
