@@ -46,12 +46,13 @@ failover), and it decouples the server from failure-detector work.
 Stage B adds the failure detector for auto-failover.
 
 Missing pieces, in dependency order:
-- a small network protocol for `VoteRequest`/`VoteReply` (reuse the
-  length-prefixed wire helpers);
-- acceptor `promised` **persistence** (currently a documented embedder
-  requirement with no library support — an acceptor that forgets a
-  promise can elect two leaders for one epoch). A tiny journaled-value
-  helper in `ticktape-cluster` closes it;
+- ~~a small network protocol for `VoteRequest`/`VoteReply`~~ — **done
+  (v0.9.0)**: `ticktape-cluster::net` (CRC'd TCP votes, `AcceptorServer`,
+  `run_election`), tested over loopback;
+- ~~acceptor `promised` **persistence**~~ — **done (v0.9.0)**:
+  `PersistentAcceptor` fsyncs `promised` before every grant; corrupt
+  record is a hard error, not a silent reset; 300-seed crash-injection
+  test proves no epoch is granted twice across restart;
 - a **command channel on the transport** (the jimgreco/core model:
   contributors carry an app id + per-app seq and publish commands on one
   channel; only the active sequencer listens and publishes events on the
