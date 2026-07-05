@@ -91,7 +91,7 @@ plus a web console. Minimal version first: a stats struct per component
 age, session count + per-session seqs, retransmit window depth, gap-fill
 counts) surfaced by the packaged server on one plain-text/HTTP endpoint.
 An interactive admin channel (pause / promote / snapshot-now / prune) is
-the natural second step and shares plumbing with P0.2's Stage-A manual
+the natural second step and shares plumbing with the no-SPOF server's Stage-A manual
 promotion.
 **Done means:** an operator can answer "is it healthy, how far behind is
 the standby, when was the last snapshot" with curl, no debugger.
