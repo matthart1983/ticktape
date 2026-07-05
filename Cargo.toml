@@ -9,6 +9,7 @@ members = [
     "crates/ticktape-sim",
     "crates/ticktape-transport",
     "crates/ticktape-cluster",
+    "crates/ticktape-server",
     "crates/ticktape-gateway",
     "crates/ticktape-bench",
     "crates/ticktape",
@@ -20,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/matthart1983/ticktape"
@@ -35,6 +36,7 @@ ticktape-runtime = { path = "crates/ticktape-runtime" }
 ticktape-sim = { path = "crates/ticktape-sim" }
 ticktape-transport = { path = "crates/ticktape-transport" }
 ticktape-cluster = { path = "crates/ticktape-cluster" }
+ticktape-server = { path = "crates/ticktape-server" }
 ticktape-gateway = { path = "crates/ticktape-gateway" }
 ticktape = { path = "crates/ticktape" }
 

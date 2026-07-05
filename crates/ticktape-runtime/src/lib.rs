@@ -343,6 +343,22 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         Ok(seq)
     }
 
+    /// Sequence an `EpochChange` fence frame — the first act of a newly
+    /// promoted leader. Its payload is `(epoch, first_seq)` (the same
+    /// encoding `ticktape-cluster::EpochChange` reads), sequenced at the
+    /// next seq, so replicas consuming the stream adopt the new epoch and
+    /// reject any straggler frames from the deposed leader's epoch. Returns
+    /// the seq the fence was assigned.
+    pub fn fence(&mut self, epoch: u64) -> Result<Seq, NodeError> {
+        let next = self.seq.next();
+        let payload = encode_to_vec(&(epoch, next.0));
+        let frame = self.sequence(FrameKind::EpochChange, payload)?;
+        let seq = frame.seq;
+        self.bus.publish(&frame);
+        self.maybe_snapshot(seq)?;
+        Ok(seq)
+    }
+
     /// Snapshot on cadence: state at `seq` is durably written *before* the
     /// `SnapshotMark` frame advertises it. The mark itself never triggers
     /// another snapshot.

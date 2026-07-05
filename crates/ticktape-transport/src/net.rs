@@ -89,6 +89,18 @@ impl Publisher {
         self.send(&packet.encode())
     }
 
+    /// Send one frame to a single explicit destination — for fan-out to N
+    /// followers, where the publisher's fixed A/B dests aren't enough.
+    pub fn publish_to(&mut self, frame: &Frame, dest: SocketAddr) -> Result<(), TransportError> {
+        self.next_seq = frame.seq.0 + 1;
+        let packet = Packet::Data {
+            session: self.config.session,
+            frames: vec![frame.clone()],
+        };
+        self.socket.send_to(&packet.encode(), dest)?;
+        Ok(())
+    }
+
     /// Advertise liveness + high-water so receivers can detect tail loss.
     pub fn heartbeat(&mut self) -> Result<(), TransportError> {
         let packet = Packet::Heartbeat {
@@ -187,6 +199,12 @@ impl<Src: PacketSource> Receiver<Src> {
     /// The seq the next delivered frame will carry.
     pub fn next_expected(&self) -> Seq {
         self.reassembler.next_expected()
+    }
+
+    /// Point gap-fill at a (possibly new) retransmitter — e.g. a follower
+    /// switching to a freshly promoted leader.
+    pub fn set_retransmitter(&mut self, addr: Option<SocketAddr>) {
+        self.config.retransmitter = addr;
     }
 
     fn fill_gap(&mut self, from: Seq, count: u64) -> Result<(), TransportError> {
