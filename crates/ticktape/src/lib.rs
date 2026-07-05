@@ -46,12 +46,14 @@
 
 pub use ticktape_core::{
     decode_all, encode_to_vec, CodecError, Ctx, Frame, FrameError, FrameKind, OutBuf, Seq, Service,
-    Timestamp, TimerReq,
+    TimerReq, Timestamp,
 };
 // Trait + derive macro under one name each (serde-style).
 pub use ticktape_cluster::{Acceptor, CommitTracker, Election, ElectionOutcome, EpochChange, Tier};
 pub use ticktape_codec::{Decode, Encode};
-pub use ticktape_journal::{FsyncPolicy, Journal, JournalConfig, JournalError, Recovered, ReplayMeta};
+pub use ticktape_journal::{
+    FsyncPolicy, Journal, JournalConfig, JournalError, Recovered, ReplayMeta,
+};
 pub use ticktape_runtime::{
     InProcBus, ManualClock, Node, NodeConfig, NodeError, RecoveryInfo, TimeSource, WallClock,
 };

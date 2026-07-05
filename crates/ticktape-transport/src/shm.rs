@@ -28,8 +28,8 @@
 //! capacity`) drops the packet — the reliable feed still has it, and the
 //! shm ring is a fast local *shortcut*, not the system of record.
 
-use crate::TransportError;
 use crate::PacketSource;
+use crate::TransportError;
 use memmap2::MmapMut;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,7 +61,10 @@ impl ShmRing {
         capacity: u64,
         max_packet: usize,
     ) -> std::io::Result<ShmRing> {
-        assert!(capacity.is_power_of_two(), "capacity must be a power of two");
+        assert!(
+            capacity.is_power_of_two(),
+            "capacity must be a power of two"
+        );
         let slot_bytes = (4 + max_packet) as u64;
         let total = HEADER_BYTES as u64 + capacity * slot_bytes;
         let file = std::fs::OpenOptions::new()
@@ -89,7 +92,10 @@ impl ShmRing {
 
     /// Attach to an existing, already-initialized ring file.
     pub fn attach(path: impl AsRef<Path>) -> std::io::Result<ShmRing> {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
         // SAFETY: the file is an initialized ring; the mapping spans it.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
         let magic = u32::from_le_bytes(mmap[OFF_MAGIC..OFF_MAGIC + 4].try_into().unwrap());
@@ -241,7 +247,10 @@ mod tests {
                 _ => panic!("expected data"),
             }
         }
-        assert!(consumer.try_recv(&mut buf).is_none(), "ring should be empty");
+        assert!(
+            consumer.try_recv(&mut buf).is_none(),
+            "ring should be empty"
+        );
     }
 
     #[test]

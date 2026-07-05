@@ -159,7 +159,11 @@ fn group_commit_latency() {
     let throughput = (batches * batch.len() as u64) as f64 / wall.as_secs_f64();
     row(
         "submit_batch (fsync=every, 64/batch)",
-        format!("{} per input · {:.2} M/s", fmt_ns(per_input), throughput / 1e6),
+        format!(
+            "{} per input · {:.2} M/s",
+            fmt_ns(per_input),
+            throughput / 1e6
+        ),
         "1 fsync amortized over the batch",
     );
 }

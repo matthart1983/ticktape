@@ -10,7 +10,7 @@
 use raft::prelude::*;
 use raft::storage::MemStorage;
 use raft::{Config, RawNode, StateRole};
-use ticktape_core::{decode_all, encode_to_vec, Ctx, OutBuf, Seq, Service, Timestamp, TimerReq};
+use ticktape_core::{decode_all, encode_to_vec, Ctx, OutBuf, Seq, Service, TimerReq, Timestamp};
 
 /// A proposal was rejected (e.g. this node is not the leader).
 #[derive(Debug)]
@@ -41,11 +41,7 @@ pub struct ServiceNode<S: Service> {
 impl<S: Service> ServiceNode<S> {
     /// Create node `id` in a cluster whose voter set is `voters`, with a fresh
     /// `Service`. All nodes must be created with the same `voters` list.
-    pub fn new(
-        id: u64,
-        voters: Vec<u64>,
-        service_config: &S::Config,
-    ) -> Result<Self, StepError> {
+    pub fn new(id: u64, voters: Vec<u64>, service_config: &S::Config) -> Result<Self, StepError> {
         let cfg = Config {
             id,
             election_tick: 10,
@@ -127,7 +123,11 @@ impl<S: Service> ServiceNode<S> {
 
         let mut light = self.raw.advance(ready);
         if let Some(commit) = light.commit_index() {
-            self.raw.mut_store().wl().mut_hard_state().set_commit(commit);
+            self.raw
+                .mut_store()
+                .wl()
+                .mut_hard_state()
+                .set_commit(commit);
         }
         messages.append(&mut light.take_messages());
         self.apply_committed(light.take_committed_entries());

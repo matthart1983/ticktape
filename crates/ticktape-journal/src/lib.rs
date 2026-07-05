@@ -685,7 +685,10 @@ mod tests {
         }
         let a = std::fs::read(single.path().join(format!("{:020}.seg", 1))).unwrap();
         let b = std::fs::read(batched.path().join(format!("{:020}.seg", 1))).unwrap();
-        assert_eq!(a, b, "batched journal bytes differ from single-append bytes");
+        assert_eq!(
+            a, b,
+            "batched journal bytes differ from single-append bytes"
+        );
 
         // And it replays to the same frames.
         let rec = open(batched.path(), 1 << 20);
@@ -712,12 +715,11 @@ mod tests {
         // Streaming: collect via the callback (in real use the caller would
         // apply each frame and never retain it).
         let mut streamed = Vec::new();
-        let (journal, meta) = Journal::<RealStorage>::replay_open(
-            JournalConfig::new(dir.path()),
-            RealStorage,
-            |f| streamed.push(f),
-        )
-        .unwrap();
+        let (journal, meta) =
+            Journal::<RealStorage>::replay_open(JournalConfig::new(dir.path()), RealStorage, |f| {
+                streamed.push(f)
+            })
+            .unwrap();
 
         assert_eq!(streamed, reference.frames, "streamed frames differ");
         assert_eq!(meta.first_seq, reference.first_seq);

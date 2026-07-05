@@ -132,7 +132,10 @@ mod tests {
         // A generic derive must produce the same bytes as writing the fields
         // out by hand — the wire format is the type's layout, not its
         // genericity. Wrap<u32>{tag, value} = [tag u16][value u32].
-        let bytes = encode_to_vec(&Wrap { tag: 0x0102u16, value: 0x0304_0506u32 });
+        let bytes = encode_to_vec(&Wrap {
+            tag: 0x0102u16,
+            value: 0x0304_0506u32,
+        });
         let mut expected = Vec::new();
         0x0102u16.encode(&mut expected);
         0x0304_0506u32.encode(&mut expected);

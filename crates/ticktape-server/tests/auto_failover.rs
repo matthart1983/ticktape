@@ -78,15 +78,21 @@ fn standby_promotes_automatically_when_the_leader_dies() {
     }
     let leader_seq = s0.seq();
     let drain_deadline = Instant::now() + Duration::from_secs(10);
-    while (s1.seq() < leader_seq || s2.seq() < leader_seq)
-        && Instant::now() < drain_deadline
-    {
+    while (s1.seq() < leader_seq || s2.seq() < leader_seq) && Instant::now() < drain_deadline {
         let _ = s1.pump(Duration::from_millis(20));
         let _ = s2.pump(Duration::from_millis(20));
     }
     let pre_state = s0.snapshot_bytes();
-    assert_eq!(s1.snapshot_bytes(), pre_state, "follower 1 diverged pre-kill");
-    assert_eq!(s2.snapshot_bytes(), pre_state, "follower 2 diverged pre-kill");
+    assert_eq!(
+        s1.snapshot_bytes(),
+        pre_state,
+        "follower 1 diverged pre-kill"
+    );
+    assert_eq!(
+        s2.snapshot_bytes(),
+        pre_state,
+        "follower 2 diverged pre-kill"
+    );
 
     // 💀 Kill the leader. No operator touches the survivors from here.
     drop(s0);
@@ -179,8 +185,16 @@ fn a_quiet_leader_is_not_mistaken_for_a_dead_one() {
         tick(&mut s1);
         tick(&mut s2);
     }
-    assert_eq!(s1.role(), Role::Follower, "idle leader triggered a false failover");
-    assert_eq!(s2.role(), Role::Follower, "idle leader triggered a false failover");
+    assert_eq!(
+        s1.role(),
+        Role::Follower,
+        "idle leader triggered a false failover"
+    );
+    assert_eq!(
+        s2.role(),
+        Role::Follower,
+        "idle leader triggered a false failover"
+    );
     assert!(!s1.leader_suspected());
     assert!(!s2.leader_suspected());
 }

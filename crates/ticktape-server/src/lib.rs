@@ -36,7 +36,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ticktape_cluster::{run_election, AcceptorServer, ElectionOutcome, EpochChange, PersistentAcceptor};
+use ticktape_cluster::{
+    run_election, AcceptorServer, ElectionOutcome, EpochChange, PersistentAcceptor,
+};
 use ticktape_core::{encode_to_vec, Frame, FrameKind, Seq, Service};
 use ticktape_journal::{FsyncPolicy, Journal, JournalConfig, RealStorage};
 use ticktape_runtime::{Node, NodeConfig};
@@ -184,6 +186,11 @@ impl FailureDetector {
     }
 }
 
+// The Leader/Follower variants hold substantial transport plumbing and differ
+// in size, but `Mode` is switched only on a role transition (promotion/
+// failover) — never on the per-input hot path — so boxing a variant would add
+// indirection to every leader/follower operation for no benefit.
+#[allow(clippy::large_enum_variant)]
 enum Mode<S: Service> {
     Leader(LeaderMode<S>),
     Follower(FollowerMode<S>),

@@ -50,12 +50,9 @@ fn dueling_candidates_never_both_win_across_acceptor_crashes() {
 
         // Every epoch each acceptor has granted — the double-grant tripwire.
         let mut granted: Vec<BTreeSet<u64>> = vec![BTreeSet::new(); NODES];
-        let mut epoch_counter = 0u64;
 
-        for _ in 0..40 {
-            epoch_counter += 1;
-            let target = epoch_counter;
-
+        // Each round bids a fresh, monotonically increasing epoch.
+        for target in 1u64..=40 {
             // Two candidates duel for the SAME epoch.
             let mut duel = [Election::new(target, NODES), Election::new(target, NODES)];
 

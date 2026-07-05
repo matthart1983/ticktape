@@ -26,7 +26,11 @@ fn open(storage: &SimStorage, clock: &SimClock, snapshot_every: Option<u64>) -> 
 /// stream-follower that joined at the start sees the world.
 fn replica_state_from_genesis(storage: &SimStorage) -> Vec<u8> {
     let re = Journal::open_with(JournalConfig::new(DIR), storage.clone()).unwrap();
-    assert_eq!(re.first_seq, Seq(1), "replica-path check needs an uncompacted journal");
+    assert_eq!(
+        re.first_seq,
+        Seq(1),
+        "replica-path check needs an uncompacted journal"
+    );
     let mut replica: Replica<OrderBook> = Replica::new(&());
     for frame in &re.frames {
         replica.apply(frame).expect("replica applies in order");
@@ -85,7 +89,11 @@ fn gtd_expiry_is_identical_on_live_replay_and_replica_paths() {
     assert!(node.verify_replay().unwrap(), "replay path diverged");
     // Replica path: an independent follower of the same stream agrees.
     let live = ticktape::encode_to_vec(&node.service().snapshot());
-    assert_eq!(replica_state_from_genesis(&storage), live, "replica path diverged");
+    assert_eq!(
+        replica_state_from_genesis(&storage),
+        live,
+        "replica path diverged"
+    );
     // Only the plain order survived.
     assert_eq!(node.service().resting_orders(), 1);
 }
@@ -129,7 +137,10 @@ fn gtd_timer_state_survives_snapshot_based_recovery_under_crashes() {
     // from the snapshot, since its arming frame was compacted away.
     storage.crash(&mut Rng::new(7), false);
     let mut node = open(&storage, &clock, Some(6));
-    assert!(node.service().has_order(500), "GTD order lost across recovery");
+    assert!(
+        node.service().has_order(500),
+        "GTD order lost across recovery"
+    );
     assert_eq!(
         node.pending_timer_count(),
         1,
@@ -141,7 +152,10 @@ fn gtd_timer_state_survives_snapshot_based_recovery_under_crashes() {
     // Now advance past its deadline: it expires, identically post-recovery.
     clock.advance(200_000);
     node.tick().unwrap();
-    assert!(!node.service().has_order(500), "GTD order should have expired after recovery");
+    assert!(
+        !node.service().has_order(500),
+        "GTD order should have expired after recovery"
+    );
     assert_eq!(node.pending_timer_count(), 0);
 
     // Final crash: the *synced* expiry is durable and replays (a torn crash
@@ -178,7 +192,10 @@ fn a_gtd_order_that_fills_before_expiry_never_fires_its_timer() {
             qty: 5,
         })
         .unwrap();
-    assert!(evts.iter().any(|e| matches!(e, Evt::Trade { .. })), "should trade");
+    assert!(
+        evts.iter().any(|e| matches!(e, Evt::Trade { .. })),
+        "should trade"
+    );
     assert!(!node.service().has_order(10));
     assert_eq!(
         node.pending_timer_count(),
@@ -192,5 +209,8 @@ fn a_gtd_order_that_fills_before_expiry_never_fires_its_timer() {
     node.service().check().unwrap();
     assert!(node.verify_replay().unwrap());
     assert_eq!(node.service().resting_orders(), 0);
-    assert_eq!(replica_state_from_genesis(&storage), ticktape::encode_to_vec(&node.service().snapshot()));
+    assert_eq!(
+        replica_state_from_genesis(&storage),
+        ticktape::encode_to_vec(&node.service().snapshot())
+    );
 }

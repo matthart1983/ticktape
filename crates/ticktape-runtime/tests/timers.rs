@@ -12,10 +12,19 @@ use ticktape_runtime::{ManualClock, Node, NodeConfig};
 /// nothing, so the output stream is exactly the firing history.
 #[derive(Encode, Decode, PartialEq, Debug)]
 enum Cmd {
-    Arm { id: u64, at: u64 },
-    Cancel { id: u64 },
+    Arm {
+        id: u64,
+        at: u64,
+    },
+    Cancel {
+        id: u64,
+    },
     /// Arm `id` to fire at `at`, and when it fires, re-arm it once at `again`.
-    ArmRepeating { id: u64, at: u64, again: u64 },
+    ArmRepeating {
+        id: u64,
+        at: u64,
+        again: u64,
+    },
 }
 
 #[derive(Encode, Decode, PartialEq, Debug)]
@@ -90,7 +99,8 @@ fn config(dir: &std::path::Path) -> NodeConfig {
 fn timer_fires_when_sequenced_time_reaches_its_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let clock = ManualClock(Timestamp(100));
-    let mut node: Node<TimersFull, _> = Node::open_with_clock(config(dir.path()), (), clock).unwrap();
+    let mut node: Node<TimersFull, _> =
+        Node::open_with_clock(config(dir.path()), (), clock).unwrap();
 
     // Arm a timer for t=500. Nothing fires yet (clock at 100).
     let (_seq, out) = node.submit(Cmd::Arm { id: 42, at: 500 }).unwrap();
@@ -101,7 +111,11 @@ fn timer_fires_when_sequenced_time_reaches_its_deadline() {
     // timer fires as part of that step and its output rides back.
     node.clock_mut().0 = Timestamp(600);
     let (_seq, out) = node.submit(Cmd::Arm { id: 99, at: 10_000 }).unwrap();
-    assert_eq!(out, vec![Fired(42)], "deadline-crossing did not fire timer 42");
+    assert_eq!(
+        out,
+        vec![Fired(42)],
+        "deadline-crossing did not fire timer 42"
+    );
     assert_eq!(node.pending_timer_count(), 1, "only timer 99 remains armed");
     assert_eq!(node.service().fired, vec![42]);
 }
@@ -135,7 +149,10 @@ fn cancel_prevents_firing() {
     assert_eq!(node.pending_timer_count(), 0);
     node.clock_mut().0 = Timestamp(1_000);
     node.tick().unwrap();
-    assert!(node.service().fired.is_empty(), "cancelled timer still fired");
+    assert!(
+        node.service().fired.is_empty(),
+        "cancelled timer still fired"
+    );
 }
 
 #[test]
@@ -156,9 +173,13 @@ fn firing_is_journaled_and_replays_identically() {
     }
     // Reopen from the journal: recovery replays the journaled TimerFired
     // frames, so the recovered service holds the identical firing history.
-    let mut node: Node<TimersFull, _> =
+    let node: Node<TimersFull, _> =
         Node::open_with_clock(config(dir.path()), (), ManualClock(Timestamp(400))).unwrap();
-    assert_eq!(node.service().fired, vec![10, 20], "recovery lost timer firings");
+    assert_eq!(
+        node.service().fired,
+        vec![10, 20],
+        "recovery lost timer firings"
+    );
     assert_eq!(node.pending_timer_count(), 0);
 }
 
@@ -174,7 +195,11 @@ fn timers_armed_before_a_snapshot_still_fire_after_recovery() {
         // the timer's arming frame is compacted below the snapshot.
         node.submit(Cmd::Arm { id: 55, at: 9_000 }).unwrap();
         for i in 0..10 {
-            node.submit(Cmd::Arm { id: 1000 + i, at: 8_000 }).unwrap();
+            node.submit(Cmd::Arm {
+                id: 1000 + i,
+                at: 8_000,
+            })
+            .unwrap();
         }
         node.sync().unwrap();
         // The wheel is part of the snapshot; timer 55 is still armed.
@@ -209,7 +234,11 @@ fn repeating_timer_rearms_from_within_its_handler() {
     node.clock_mut().0 = Timestamp(250);
     node.tick().unwrap(); // fires the re-armed instance
     assert_eq!(node.service().fired, vec![5, 5]);
-    assert_eq!(node.pending_timer_count(), 0, "re-armed timer should not repeat again");
+    assert_eq!(
+        node.pending_timer_count(),
+        0,
+        "re-armed timer should not repeat again"
+    );
 
     // And this whole re-arm dance replays deterministically.
     assert!(node.verify_replay().unwrap());

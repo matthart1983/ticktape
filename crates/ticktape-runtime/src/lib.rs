@@ -29,7 +29,7 @@ use std::fmt;
 use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use ticktape_core::{
-    decode_all, encode_to_vec, Ctx, Frame, FrameKind, OutBuf, Seq, Service, Timestamp, TimerReq,
+    decode_all, encode_to_vec, Ctx, Frame, FrameKind, OutBuf, Seq, Service, TimerReq, Timestamp,
 };
 use ticktape_journal::{Journal, JournalConfig, JournalError, RealStorage, SnapshotStore, Storage};
 
@@ -40,6 +40,10 @@ use timer::TimerWheel;
 /// timer wheel (`(id, deadline_nanos, set_at_seq)` triples), so timers armed
 /// before the snapshot still fire after a snapshot-based recovery.
 type SnapshotPayload<S> = (<S as Service>::Snapshot, Vec<(u64, u64, u64)>);
+
+/// Committed `(seq, outputs)` pairs released by a Tier-2 quorum leader, in seq
+/// order — what `submit_batch` and `record_ack` hand back.
+type Committed<S> = Vec<(Seq, Vec<<S as Service>::Output>)>;
 
 pub use ticktape_journal::FsyncPolicy;
 
@@ -471,10 +475,7 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         }
 
         let seq = recovered_tip;
-        let commit = config
-            .commit
-            .as_ref()
-            .map(|c| CommitState::new(c, seq));
+        let commit = config.commit.as_ref().map(|c| CommitState::new(c, seq));
         Ok(Node {
             service,
             service_config,
@@ -539,10 +540,7 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
     /// Returns one `(seq, released outputs)` per input, in order (each
     /// entry's outputs follow the same Tier-0/1 vs Tier-2 rules as `submit`,
     /// and include any timers that fired as a consequence of that input).
-    pub fn submit_batch(
-        &mut self,
-        inputs: &[S::Input],
-    ) -> Result<Vec<(Seq, Vec<S::Output>)>, NodeError> {
+    pub fn submit_batch(&mut self, inputs: &[S::Input]) -> Result<Committed<S>, NodeError> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
@@ -627,8 +625,11 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
     fn fire_due_timers(&mut self) -> Result<Vec<S::Output>, NodeError> {
         let mut released = Vec::new();
         while let Some(id) = self.timers.pop_due(self.last_timestamp) {
-            let frame =
-                self.sequence_at(FrameKind::TimerFired, encode_to_vec(&id), self.last_timestamp)?;
+            let frame = self.sequence_at(
+                FrameKind::TimerFired,
+                encode_to_vec(&id),
+                self.last_timestamp,
+            )?;
             let outputs = self.run_step(&frame, |svc, ctx| svc.on_timer(id, ctx));
             released.extend(self.finish_frame(&frame, outputs)?);
         }
@@ -642,7 +643,7 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
     ///
     /// `replica` must differ from the leader's own [`CommitConfig::self_replica`];
     /// the leader records itself automatically on each [`Node::submit`].
-    pub fn record_ack(&mut self, replica: u32, seq: Seq) -> Vec<(Seq, Vec<S::Output>)> {
+    pub fn record_ack(&mut self, replica: u32, seq: Seq) -> Committed<S> {
         match &mut self.commit {
             None => Vec::new(),
             Some(state) => {
@@ -735,8 +736,7 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         // Capture the service state *and* the pending timer wheel, so timers
         // armed before this snapshot still fire after a snapshot-based
         // recovery.
-        let payload: Vec<u8> =
-            encode_to_vec(&(self.service.snapshot(), self.timers.snapshot()));
+        let payload: Vec<u8> = encode_to_vec(&(self.service.snapshot(), self.timers.snapshot()));
         self.snapshots.write(seq, 0, &payload)?;
         let mark = self.sequence(FrameKind::SnapshotMark, encode_to_vec(&seq))?;
         self.bus.publish(&mark);
@@ -858,33 +858,38 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         // `TimerFired` frame is an input to the service like any other. Timer
         // *scheduling* is ignored here (this check only compares state, which
         // the journaled firings already determine).
-        Journal::replay_open(
-            self.journal_config.clone(),
-            self.storage.clone(),
-            |frame| {
-                if decode_err.is_some() {
-                    return;
-                }
-                let mut apply = |step: &mut dyn FnMut(&mut S, &mut Ctx<'_, S::Output>)| {
-                    timer_ops.clear();
-                    let mut ctx =
-                        Ctx::new(frame.seq, frame.timestamp, &mut outputs, &mut timer_ops);
-                    step(&mut replayed, &mut ctx);
-                    outputs.drain();
-                };
-                match frame.kind {
-                    FrameKind::Input => match decode_all::<S::Input>(&frame.payload) {
-                        Ok(input) => apply(&mut |svc, ctx| svc.apply(frame.seq, &input, ctx)),
-                        Err(err) => decode_err = Some(NodeError::CorruptInput { seq: frame.seq, err }),
-                    },
-                    FrameKind::TimerFired => match decode_all::<u64>(&frame.payload) {
-                        Ok(id) => apply(&mut |svc, ctx| svc.on_timer(id, ctx)),
-                        Err(err) => decode_err = Some(NodeError::CorruptInput { seq: frame.seq, err }),
-                    },
-                    _ => {}
-                }
-            },
-        )?;
+        Journal::replay_open(self.journal_config.clone(), self.storage.clone(), |frame| {
+            if decode_err.is_some() {
+                return;
+            }
+            let mut apply = |step: &mut dyn FnMut(&mut S, &mut Ctx<'_, S::Output>)| {
+                timer_ops.clear();
+                let mut ctx = Ctx::new(frame.seq, frame.timestamp, &mut outputs, &mut timer_ops);
+                step(&mut replayed, &mut ctx);
+                outputs.drain();
+            };
+            match frame.kind {
+                FrameKind::Input => match decode_all::<S::Input>(&frame.payload) {
+                    Ok(input) => apply(&mut |svc, ctx| svc.apply(frame.seq, &input, ctx)),
+                    Err(err) => {
+                        decode_err = Some(NodeError::CorruptInput {
+                            seq: frame.seq,
+                            err,
+                        })
+                    }
+                },
+                FrameKind::TimerFired => match decode_all::<u64>(&frame.payload) {
+                    Ok(id) => apply(&mut |svc, ctx| svc.on_timer(id, ctx)),
+                    Err(err) => {
+                        decode_err = Some(NodeError::CorruptInput {
+                            seq: frame.seq,
+                            err,
+                        })
+                    }
+                },
+                _ => {}
+            }
+        })?;
         if let Some(e) = decode_err {
             return Err(e);
         }

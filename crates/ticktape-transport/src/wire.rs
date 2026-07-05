@@ -128,7 +128,13 @@ pub fn encode_data_into(session: u64, frames: &[Frame], out: &mut Vec<u8>) {
     debug_assert!(!frames.is_empty(), "data packet must carry frames");
     out.clear();
     out.reserve(data_packet_len(frames));
-    encode_header_into(KIND_DATA, frames.len() as u16, session, frames[0].seq.0, out);
+    encode_header_into(
+        KIND_DATA,
+        frames.len() as u16,
+        session,
+        frames[0].seq.0,
+        out,
+    );
     for frame in frames {
         frame.write_to(out);
     }

@@ -268,7 +268,11 @@ mod tests {
         out.extend_from_slice(&0x0102_0304u32.to_le_bytes()); // the new field
         let (back, consumed) = decode_message::<NewOrder>(&out).unwrap();
         assert_eq!(back, sample());
-        assert_eq!(consumed, HEADER_LEN + 26, "must consume the full advertised block");
+        assert_eq!(
+            consumed,
+            HEADER_LEN + 26,
+            "must consume the full advertised block"
+        );
     }
 
     #[test]

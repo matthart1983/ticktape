@@ -165,6 +165,9 @@ fn ticks_advance_the_leader_high_water_so_commit_tracks_the_tip() {
     // Follower acks the tip (seq 3). Majority through 3 → both inputs
     // release; the tick contributes no output.
     let released = node.record_ack(1, Seq(3));
-    assert_eq!(released, vec![(Seq(1), vec![Ack(1)]), (Seq(3), vec![Ack(2)])]);
+    assert_eq!(
+        released,
+        vec![(Seq(1), vec![Ack(1)]), (Seq(3), vec![Ack(2)])]
+    );
     assert_eq!(node.commit_watermark(), Seq(3));
 }

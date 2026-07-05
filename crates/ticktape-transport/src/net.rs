@@ -2,7 +2,9 @@
 //! publishing, the receiving poll loop, and the TCP retransmitter.
 
 use crate::reassembler::Reassembler;
-use crate::wire::{self, data_packet_len, Packet, RetransmitRequest, MAX_PACKET_BYTES, REQUEST_LEN};
+use crate::wire::{
+    self, data_packet_len, Packet, RetransmitRequest, MAX_PACKET_BYTES, REQUEST_LEN,
+};
 use crate::TransportError;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -113,7 +115,11 @@ impl Publisher {
     /// Send one frame on both channels.
     pub fn publish(&mut self, frame: &Frame) -> Result<(), TransportError> {
         self.next_seq = frame.seq.0 + 1;
-        wire::encode_data_into(self.config.session, std::slice::from_ref(frame), &mut self.buf);
+        wire::encode_data_into(
+            self.config.session,
+            std::slice::from_ref(frame),
+            &mut self.buf,
+        );
         self.send_buf()
     }
 
@@ -121,7 +127,11 @@ impl Publisher {
     /// followers, where the publisher's fixed A/B dests aren't enough.
     pub fn publish_to(&mut self, frame: &Frame, dest: SocketAddr) -> Result<(), TransportError> {
         self.next_seq = frame.seq.0 + 1;
-        wire::encode_data_into(self.config.session, std::slice::from_ref(frame), &mut self.buf);
+        wire::encode_data_into(
+            self.config.session,
+            std::slice::from_ref(frame),
+            &mut self.buf,
+        );
         self.socket.send_to(&self.buf, dest)?;
         Ok(())
     }

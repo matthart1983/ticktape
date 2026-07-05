@@ -13,7 +13,7 @@
 //! set-at-seq, id)` order, never in hash order.
 
 use std::collections::{BTreeMap, BTreeSet};
-use ticktape_core::{Seq, Timestamp, TimerReq};
+use ticktape_core::{Seq, TimerReq, Timestamp};
 
 pub(crate) struct TimerWheel {
     /// `id -> (deadline, seq it was armed at)`. The source of truth for
@@ -103,7 +103,7 @@ mod tests {
         w.set(7, Timestamp(100), Seq(1));
         w.set(3, Timestamp(50), Seq(2));
         w.set(9, Timestamp(50), Seq(2)); // same deadline+seq, higher id last
-        // Nothing due before 50.
+                                         // Nothing due before 50.
         assert_eq!(w.pop_due(Timestamp(49)), None);
         // At 50: the two deadline-50 timers fire, id-ordered (3 before 9).
         assert_eq!(w.pop_due(Timestamp(50)), Some(3));
