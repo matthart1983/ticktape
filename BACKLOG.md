@@ -295,15 +295,29 @@ to be verified on the Linux NUC.**
   clean seams (the new shm ring is proof — it slotted in as another
   `PacketSource`). No work item; owning the journal stays non-negotiable (DST
   moat).
-- **Simulator fault gaps** — assessed, low marginal value for *this* codebase:
-  *directory-entry loss* has no observable window (the journal and snapshot
-  store both `sync_dir` immediately after every file creation, and the sim only
-  crashes between operations); *non-prefix page flushes* are unrealistic for an
-  append-only, ordered-write log (prefix survival is the correct model, and a
-  hole would just read as CRC corruption). The genuinely-additive ones —
-  acceptor crash/restart inside the *multi-node* `cluster_sim`, and driving that
-  sim through the real `Reassembler` — are sizeable DST rewrites; the acceptor's
-  crash-safety is already covered by the 300-seed `acceptor_persistence.rs`.
+- **Simulator fault gaps** — mostly done or assessed-not-worth-it:
+  - **✅ Multi-node acceptor crash/restart** (v0.19.0) —
+    `multi_acceptor_crash_sim.rs`: N `PersistentAcceptor`s over per-node
+    `SimStorage`, two candidates dueling for the *same* epoch while acceptors
+    crash and restart mid-election, across 300 seeds. Asserts no acceptor
+    grants an epoch twice (durable `promised` survives the crash) and hence at
+    most one candidate wins — the property that stops a restarted acceptor
+    resurrecting a second leader. **Mutation-verified**: disabling the promise
+    replay on reopen makes it fail immediately ("granted epoch N twice").
+  - *Directory-entry loss* and *non-prefix page flushes* — assessed, no value
+    for this codebase: the journal and snapshot store both `sync_dir`
+    immediately after every file creation (and the sim only crashes between
+    operations), so dir-entry loss has no observable window; prefix-survival is
+    the correct crash model for an append-only ordered-write log, and a
+    non-prefix hole would simply read as CRC corruption.
+  - *Real `Reassembler` inside `cluster_sim`* — deliberately not done. The
+    Reassembler is already covered independently (the dedicated
+    `fuzz_reassembly.rs` + real-UDP `loopback.rs` with gap-fill), and
+    `cluster_sim` abstracts transport on purpose to isolate consensus/fencing
+    safety — its in-order delivery *is* the Reassembler's contract, modeled
+    correctly (the `Replica` rejects out-of-order frames). Wiring the real one
+    in would re-test covered transport logic without exposing new consensus
+    bugs, at the cost of a large rewrite of the most intricate test in the tree.
 - **`openraft` delegation backend** — explicitly build-only-if-wanted (spec §9
   open question). No demand yet.
 - **Docs: a short book / teaching deck** — deferred (docs, not code).
