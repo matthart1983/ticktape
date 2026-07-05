@@ -82,6 +82,33 @@ fn ab_redundancy_covers_single_channel_loss() {
 }
 
 #[test]
+fn unix_datagram_source_delivers_the_stream_in_order() {
+    // The UnixDatagram PacketSource (same-host IPC without UDP) must feed a
+    // Receiver exactly like a UDP socket does.
+    use std::os::unix::net::UnixDatagram;
+    let (tx, rx) = UnixDatagram::pair().unwrap();
+
+    for seq in 1..=30u64 {
+        let bytes = ticktape_transport::wire::Packet::Data {
+            session: SESSION,
+            frames: vec![frame(seq)],
+        }
+        .encode();
+        tx.send(&bytes).unwrap();
+    }
+
+    let mut receiver = Receiver::new(
+        rx,
+        None,
+        ReceiverConfig {
+            from: Seq(1),
+            retransmitter: None,
+        },
+    );
+    assert_eq!(drain(&mut receiver, 30), (1..=30).collect::<Vec<_>>());
+}
+
+#[test]
 fn batched_publish_packs_many_frames_and_reassembles_in_order() {
     // The batching publisher must deliver a contiguous run intact and in
     // order, packing multiple frames per packet (fewer datagrams than

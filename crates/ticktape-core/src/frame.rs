@@ -257,6 +257,34 @@ mod tests {
     }
 
     #[test]
+    fn header_layout_matches_wire_spec() {
+        // Pins the exact byte offsets documented in WIRE.md §1 so the code
+        // and the spec cannot drift apart silently.
+        use crate::crc32c::crc32c;
+        let f = Frame::new(
+            Seq(0x0102_0304_0506_0708),
+            Timestamp(0x1112_1314_1516_1718),
+            0x2122,
+            FrameKind::Input,
+            b"xy".to_vec(),
+        );
+        let b = f.to_bytes();
+        assert_eq!(b.len(), 28 + 2 + 4);
+        assert_eq!(&b[0..8], &0x0102_0304_0506_0708u64.to_le_bytes(), "seq @0");
+        assert_eq!(&b[8..16], &0x1112_1314_1516_1718u64.to_le_bytes(), "timestamp @8");
+        assert_eq!(&b[16..18], &0x2122u16.to_le_bytes(), "stream_id @16");
+        assert_eq!(&b[18..20], &0x0001u16.to_le_bytes(), "kind @18 (Input)");
+        assert_eq!(&b[20..24], &2u32.to_le_bytes(), "payload_len @20");
+        assert_eq!(
+            &b[24..28],
+            &crc32c(&b[0..24]).to_le_bytes(),
+            "header_crc @24 over [0,24)"
+        );
+        assert_eq!(&b[28..30], b"xy", "payload @28");
+        assert_eq!(&b[30..34], &crc32c(b"xy").to_le_bytes(), "payload_crc");
+    }
+
+    #[test]
     fn detects_truncation() {
         let bytes = sample().to_bytes();
         let mut cursor = &bytes[..bytes.len() - 1];
