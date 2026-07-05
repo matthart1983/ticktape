@@ -317,19 +317,23 @@ schema evolution never touches framework wire stability.
 
 ## Status & roadmap
 
-**Today (M0–M6):** a usable, durable, deterministic-service library with
-snapshot-accelerated recovery, a fused simulation-testing harness, a
-reliable sequenced transport feeding cross-process follower replicas,
-simulation-verified failover machinery (elections, fencing, quorum
-commit), a TCP gateway with sessions, dedup, flow control,
-cancel-on-disconnect, and drop-copy, and benchmarks in CI against the
-spec's budgets. **The spine of the spec is walked.** What is *not* done is
-audited honestly in [BACKLOG.md](BACKLOG.md) — highlights: events to
-offline sessions are dropped (no session-stream replay yet), three stores
-grow unbounded (retransmit history, old snapshots, journal segments), the
-failover machinery is simulation-proven but not yet packaged as an
-auto-failing-over server, and the async group-commit/`io_uring`
-performance workstream (see Performance). The API will still move.
+**Today (M0–M6, plus 24×7 operation):** a usable, durable,
+deterministic-service library with snapshot-accelerated recovery, a fused
+simulation-testing harness, a reliable sequenced transport feeding
+cross-process follower replicas, simulation-verified failover machinery
+(elections, fencing, quorum commit), a TCP gateway with sessions, dedup,
+flow control, cancel-on-disconnect, and drop-copy, and benchmarks in CI
+against the spec's budgets. **The spine of the spec is walked**, and the
+big "does it run forever" gap is closed: journal compaction + snapshot
+pruning bound disk, a bounded repeater / journal-backed rewinder bound
+retransmit memory, and recovery leans on snapshots when history is
+compacted away — all fault-injection-verified, so a node runs 24×7/365
+with no restart or day-roll. What remains is audited honestly in
+[BACKLOG.md](BACKLOG.md): the no-single-point-of-failure *packaged*
+replicated server (the machinery is simulation-proven but not yet wired
+to live sockets), an admin/observability plane, offline-session event
+replay, and the async group-commit/`io_uring` performance workstream. The
+API will still move.
 
 | Milestone | Scope | Status |
 |---|---|---|

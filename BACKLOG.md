@@ -10,43 +10,25 @@ below works as documented but is incomplete as a product.
 from a builder of a production core-derived platform (SBE/Aeron stack).
 Their two disqualifiers for platforms in this space — *can it run
 24×7/365 without filling a disk* and *is every component redundant* — are
-P0. Everything else follows.
+P0. The first (24×7 operation) is **done as of v0.8.0**; the packaged
+no-SPOF replicated deployment is now the top open item.
 
 ## P0 — platform viability (the practitioner's disqualifiers)
 
-### 1. 24×7/365 continuous operation — bounded disk and memory, forever
-This is exactly the property that disqualifies jimgreco/core for
-continuous operation — "no snapshot service and it doesn't prune the
-journal" — and the property Aeron Cluster is prized for (snapshots +
-journal pruning so disk never fills). ticktape already has the snapshot
-half (M2, with corrupt-fallback and stale-purge); the pruning half below
-is what turns "runs for a session" into "runs forever". Three unbounded
-stores today:
+### ✅ 1. 24×7/365 continuous operation — DONE (v0.8.0)
+Journal compaction (`compact_below`, `reseat_to`) + snapshot pruning
+(`retain_snapshots`, default 2) bound disk; the transport's
+`MoldRepeater`/`MoldRewinder`-style split — a bounded in-memory `MemStore`
+repeater + a journal-backed `JournalRewinder`, composed by `ChainStore` —
+bounds retransmit memory; recovery anchors on a snapshot when history is
+compacted away (and reseats the journal when a synced snapshot outlives
+its unsynced tail). All fault-injection-verified: compaction/prune/reseat
+fire on nearly every VOPR seed, the sim's invariants are compaction-aware,
+and the feed example ran to seq 1,400 on one segment + two snapshots with a
+late joiner backfilling from disk. **A node now runs 24×7/365 with no
+restart or day-roll.**
 
-- **Journal segments accumulate forever.** Fix: compaction —
-  archive/delete segments wholly below the newest durable snapshot (the
-  spec's §12 note). This also unlocks true fast recovery: today recovery
-  still reads and CRC-verifies every segment even when a snapshot skips
-  the re-apply, so post-compaction recovery cost is bounded by snapshot
-  cadence, not journal age.
-- **Old snapshot files are never pruned** (`purge_after` removes only
-  *fenced* ones). Fix: keep the newest N valid snapshots, delete the rest
-  at snapshot time.
-- **`transport::MemStore` (retransmit) never evicts** — a long-running
-  feed leaks its entire history in memory. Fix: split the retransmitter
-  the way jimgreco/core splits `MoldRepeater`/`MoldRewinder` — a
-  **repeater** serving live gap-fill from a bounded in-memory recent
-  window, and a **rewinder** serving historical ranges by reading journal
-  segments (post-compaction: snapshot + tail, which is also how late
-  joiners bootstrap without full history). This also fixes the feed
-  example's late-join-across-restart gap (P3).
-
-**Done means:** a week-long soak of the feed example holds steady RSS and
-disk bounded by config; recovery time is bounded by snapshot cadence, not
-journal age — i.e. **continuous 24×7/365 operation with no restart or
-day-roll required, ever**.
-
-### 2. No single point of failure — the replicated deployment
+### 1. No single point of failure — the replicated deployment  (top open item)
 "The sequencer needs several running at the same time; the journal also
 needs several running, replicated, so that all the single points of
 failure are removed." In this architecture a *replicated journal* is not
@@ -210,9 +192,8 @@ throughput budget vs 0.8–1.7 M/s.
 - Derive macros: generic type support (removes the hand-written codecs in
   `ticktape-gateway`).
 - Test the `UnixDatagram` packet source (implemented, unused by tests).
-- Feed example: backfill the retransmit store from the recovered journal
-  so late joiners work across leader restarts (subsumed by P0.1's
-  rewinder).
+- ~~Feed example: backfill late joiners from the journal across restarts~~
+  — **done in v0.8.0** (the feed leader runs on a repeater/rewinder chain).
 - `openraft` delegation backend behind a `raft-backend` feature (spec §9
   open question — build only if someone actually wants it).
 - Docs: a short book / teaching deck (spec M6 item, deferred).
