@@ -255,6 +255,11 @@ CI runs 2000 fresh seeds on every push.
 
 ## Documentation
 
+- **[Interactive deck →](https://www.netwatchlabs.com/learn/ticktape-sequencer.html#1)**
+  — *the sequencer architecture, in your browser.* Drive it: stamp a command
+  through the sequencer, crash and replay a node, reproduce a seeded VOPR fuzz
+  run, drop packets on the A/B feeds, and kill a leader mid-stream. The best
+  place to start.
 - **[docs/GUIDE.md](docs/GUIDE.md)** — a guided tour: the one idea, the
   `Service` contract, your first service, durability tiers, recovery, the
   simulator, and going multi-node. Read this to *learn* Ticktape.
