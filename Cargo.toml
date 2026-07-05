@@ -11,6 +11,8 @@ members = [
     "crates/ticktape-cluster",
     "crates/ticktape-server",
     "crates/ticktape-gateway",
+    "crates/ticktape-sbe",
+    "crates/ticktape-raft",
     "crates/ticktape-bench",
     "crates/ticktape",
     "examples/counter",
@@ -38,6 +40,8 @@ ticktape-transport = { path = "crates/ticktape-transport" }
 ticktape-cluster = { path = "crates/ticktape-cluster" }
 ticktape-server = { path = "crates/ticktape-server" }
 ticktape-gateway = { path = "crates/ticktape-gateway" }
+ticktape-sbe = { path = "crates/ticktape-sbe" }
+ticktape-raft = { path = "crates/ticktape-raft" }
 ticktape = { path = "crates/ticktape" }
 
 [profile.release]
