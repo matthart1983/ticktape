@@ -1,0 +1,21 @@
+[package]
+name = "ticktape-raft"
+description = "raft-rs delegation backend for Ticktape: drive a deterministic Service from a Raft-ordered log (spec §9, feature-gated)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ticktape-core.workspace = true
+raft = { version = "0.7", optional = true }
+slog = { version = "2", optional = true }
+
+[features]
+# raft-rs-backed replication (spec §9). Off by default so the workspace stays
+# lean unless you opt in. raft-rs is synchronous — no async runtime is imposed.
+raft-backend = ["dep:raft", "dep:slog"]
+
+[dev-dependencies]
+ticktape-codec.workspace = true

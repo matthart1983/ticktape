@@ -286,11 +286,28 @@ to be verified on the Linux NUC.**
   hand-written codecs remain in the tree.
 - **✅ Tested the `UnixDatagram` packet source** (was implemented, unexercised).
 
+**Also done (v0.20.0):**
+- **✅ SBE codec adapter** (spec §6 tier 3) — new `ticktape-sbe` crate:
+  `SbeHeader` (the 8-byte SBE message header), an `SbeMessage` trait, and
+  `Sbe<T>` which implements Ticktape's own `Encode`/`Decode` by SBE-framing `T`
+  — so `Service::Input = Sbe<MyMsg>` puts SBE bytes into the journal/stream,
+  interoperable with SBE tooling. Handles SBE schema evolution (a decoder skips
+  a newer writer's longer block). Dependency-free; 5 tests.
+- **✅ Raft delegation backend — as `ticktape-raft` over tikv/raft-rs, NOT
+  openraft.** Reconsidered the spec's named choice on review: openraft imposes
+  an async runtime and owns its event loop, which is incompatible with
+  Ticktape's synchronous model and can't be stepped inside the deterministic
+  simulator; **raft-rs is a synchronous consensus module you drive yourself**
+  (own the storage, tick clock, and `Ready` loop), so it fits the run-to-
+  completion model and keeps far more of the DST story. `ServiceNode<S>` wraps a
+  raft-rs `RawNode` + a Ticktape `Service`: committed Raft entries are decoded
+  and applied to `Service::apply`, unchanged. Feature-gated (`raft-backend`,
+  off by default; needs a 3.21-era `protoc` to build — raft-proto's codegen).
+  Verified by a 3-node in-process convergence test (no threads/wall-clock — the
+  loop is the clock): elect a leader, replicate 50 inputs, all converge to
+  bit-identical state; a follower's proposal is refused.
+
 **Not done — deferred with rationale:**
-- **SBE codec adapter** (spec §6 tier 3) — a *real* SBE adapter means matching
-  the SBE wire format + schema tooling for interop with existing SBE
-  ecosystems; that is a substantial feature, not polish. The canonical `fixed`
-  tier already covers in-house use. Deferred until an actual interop need.
 - **Transport swappable** — already satisfied: `PacketSource` / publisher are
   clean seams (the new shm ring is proof — it slotted in as another
   `PacketSource`). No work item; owning the journal stays non-negotiable (DST
@@ -318,8 +335,6 @@ to be verified on the Linux NUC.**
     correctly (the `Replica` rejects out-of-order frames). Wiring the real one
     in would re-test covered transport logic without exposing new consensus
     bugs, at the cost of a large rewrite of the most intricate test in the tree.
-- **`openraft` delegation backend** — explicitly build-only-if-wanted (spec §9
-  open question). No demand yet.
 - **Docs: a short book / teaching deck** — deferred (docs, not code).
 
 **Decisions pending (yours):**
