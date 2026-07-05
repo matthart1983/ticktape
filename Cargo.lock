@@ -4,6 +4,12 @@ version = 4
 
 [[package]]
 name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
+
+[[package]]
+name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
@@ -16,7 +22,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "counter"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "ticktape",
  "ticktape-core",
@@ -34,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "exchange"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "orderbook",
  "tempfile",
@@ -52,7 +58,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "feed"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "ticktape",
  "ticktape-journal",
@@ -72,8 +78,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "595a0399f411a508feb2ec1e970a4a30c249351e30208960d58298de8660b0e5"
+dependencies = [
+ "bitflags 1.3.2",
+ "libc",
+]
+
+[[package]]
 name = "kv"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "tempfile",
  "ticktape",
@@ -94,6 +110,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -101,7 +126,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "orderbook"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "tempfile",
  "ticktape",
@@ -139,7 +164,7 @@ version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.0",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -172,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "ticktape-cluster",
  "ticktape-codec",
@@ -185,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape-bench"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "tempfile",
  "ticktape-core",
@@ -197,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape-cluster"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "tempfile",
  "ticktape-codec",
@@ -210,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape-codec"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "ticktape-core",
  "ticktape-macros",
@@ -218,11 +243,11 @@ dependencies = [
 
 [[package]]
 name = "ticktape-core"
-version = "0.16.0"
+version = "0.17.0"
 
 [[package]]
 name = "ticktape-gateway"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "tempfile",
  "ticktape-codec",
@@ -233,15 +258,16 @@ dependencies = [
 
 [[package]]
 name = "ticktape-journal"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
+ "io-uring",
  "tempfile",
  "ticktape-core",
 ]
 
 [[package]]
 name = "ticktape-macros"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -250,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape-runtime"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "tempfile",
  "ticktape-codec",
@@ -260,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape-server"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "tempfile",
  "ticktape-cluster",
@@ -273,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape-sim"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "ticktape-codec",
  "ticktape-core",
@@ -283,8 +309,9 @@ dependencies = [
 
 [[package]]
 name = "ticktape-transport"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
+ "memmap2",
  "tempfile",
  "ticktape-core",
  "ticktape-journal",

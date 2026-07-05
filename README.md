@@ -350,12 +350,11 @@ journaled it, releasing them at the commit watermark as follower acks
 arrive — proven by a 300-seed differential simulation against the runtime's
 own machinery plus a 200-seed crash run showing no committed output is lost
 across power loss. What remains is audited in
-[BACKLOG.md](BACKLOG.md): wiring the Tier-2 deferred-ack mode to a
-live follower ack channel in the packaged server, and the two deferred
-performance items (an `io_uring` journal backend and a shared-memory ring,
-both behind a dependency decision) — the rest of the perf workstream
-(group commit, hardware CRC32C, packet batching, streaming replay) has
-landed.
+[BACKLOG.md](BACKLOG.md): mainly wiring the Tier-2 deferred-ack mode to a
+live follower ack channel in the packaged server. The performance
+workstream has landed — group commit, hardware CRC32C, packet batching,
+streaming replay, plus feature-gated `io_uring` (Linux) and shared-memory
+ring backends.
 Operators get a Prometheus `/metrics` endpoint per server (role, replication
 lag, snapshot seq, disk) to watch a deployment and drive failover. The API
 will still move.
@@ -365,7 +364,7 @@ will still move.
 | M0 — Core + single node | `Service`/`Ctx`, codec + derives, segmented journal, replay recovery | ✅ |
 | M1 — Determinism harness | `ticktape-sim`: seeded storage faults, invariant checks, VOPR loop + shrinking | ✅ |
 | M2 — Snapshotting + flagship example | Snapshot store, `SnapshotMark`, fast recovery; the order book with no-crossed-book / share-conservation invariants under simulation | ✅ |
-| M3 — Transport | Reliable sequenced UDP (MoldUDP64-style A/B feeds), TCP gap-fill retransmitter, follower `Replica`; shm IPC ring deferred to the perf pass | ✅ |
+| M3 — Transport | Reliable sequenced UDP (MoldUDP64-style A/B feeds), TCP gap-fill retransmitter, follower `Replica`; feature-gated shared-memory ring for same-box fan-out | ✅ |
 | M4 — Replication + failover | Epoch-lease elections + fencing (Tier 1, the classic exchange mode) and VSR-shaped quorum commit (Tier 2); leader kills, partitions, and dueling candidates in the simulator | ✅ |
 | M5 — Gateways | Client sessions: dedup, flow control, cancel-on-disconnect, drop-copy; external clients drive the order book end-to-end over TCP | ✅ |
 | M6 — Hardening | Benchmarks in CI against the spec budgets; compute paths beat budget, group commit (`submit_batch`) closes the synced-fsync gap, hardware CRC32C + packet batching + streaming replay landed (`io_uring`/shm-ring deferred behind a dependency decision) | ✅ |
@@ -396,12 +395,13 @@ on macOS turns ≈ 4 ms/input into ≈ 66 µs/input (~60×) and reaches the
 budget on real NVMe. Hardware CRC32C (10.7 GB/s), packet batching
 (`Publisher::publish_batch`, many frames per datagram), streaming replay
 (`Journal::replay_open`, no `Vec<Frame>` materialization), and a reusable
-encode buffer on the append/publish hot paths round out the landed
-workstream. Two items remain deferred behind a dependency + Linux decision
-— an `io_uring`/`O_DIRECT` journal `Storage` backend and a shared-memory
-`PacketSource` ring — both slotting into existing seams; see
-[BACKLOG.md](BACKLOG.md) §P2. Until those land, run `fsync=never` +
-Tier 1/2 replication (or `submit_batch`) for durable throughput.
+encode buffer on the append/publish hot paths round out the always-on
+workstream. Two further backends ship feature-gated (default build stays
+dependency-free): an `io_uring` journal `Storage` (`--features io-uring`,
+Linux) that submits appends + `fdatasync` through a ring, and a
+shared-memory `PacketSource` ring (`--features shm`) for zero-syscall
+same-box fan-out — each slotting into an existing seam (`Storage` /
+`PacketSource`). See [BACKLOG.md](BACKLOG.md) §P2.
 
 ## Relation to prior art
 

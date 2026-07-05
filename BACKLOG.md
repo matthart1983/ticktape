@@ -206,8 +206,10 @@ Benchmarked gaps (see README Performance): synced-fsync p99 budget of
 15 µs vs measured 200 µs (Linux) / ~4 ms (macOS); 2–3 M frames/s
 throughput budget vs 0.8–1.7 M/s.
 
-**Status: 5 of 7 landed in v0.16.0; 2 (io_uring, shm ring) deferred pending
-a dependency + Linux decision — see below.**
+**Status: all 7 landed (5 in v0.16.0; io_uring + shm ring in v0.17.0, both
+feature-gated so the default build stays dependency-free). The shm ring is
+verified on macOS; the io_uring backend is Linux-only — written and gated,
+to be verified on the Linux NUC.**
 
 1. **✅ Group commit — DONE.** `Journal::append_batch` writes a whole
    contiguous run with one `write_all` + one fsync, and `Node::submit_batch`
@@ -223,18 +225,27 @@ a dependency + Linux decision — see below.**
    many seq-contiguous frames as fit (≤ `MAX_PACKET_BYTES`) into each packet
    — one syscall per packet, not per frame — encoding through a reusable
    buffer. Round-trips through the real receiver in a loopback test.
-3. **◻ `io_uring` / `O_DIRECT` journal path — DEFERRED (dependency + Linux).**
-   Needs the `io-uring`/`libc` crate and a Linux kernel; unverifiable on the
-   macOS dev box, and adds the workspace's first non-dev dependency. The seam
-   already exists: it is a `Storage` impl (the trait the fault-injecting
-   `SimStorage` also implements), so it slots in without touching the
-   journal. Awaiting a call on introducing the dependency.
-4. **◻ Shared-memory IPC ring — DEFERRED (dependency + new subsystem).** The
-   spec's IpcShm for same-box fan-out. A real cross-process ring needs
-   `mmap` (a `libc`/`memmap2` dependency) and is a sizeable new module. The
-   `PacketSource` trait is the seam — a shm ring is another source alongside
-   UDP/Unix-datagram — so it slots in behind the existing transport
-   abstraction. Awaiting the same dependency call as #3.
+3. **✅ `io_uring` journal path — DONE (v0.17.0, Linux-only, feature-gated).**
+   `ticktape-journal`'s `io-uring` feature adds `IoUringStorage: Storage`
+   whose open segments submit their appends and data-syncs through a per-file
+   `io_uring` ring — so an `append_batch` commit becomes one submitted write +
+   one submitted `fdatasync`. Cold-path ops (list/read/create/truncate) stay
+   on `std::fs`. The dep is `[target.'cfg(target_os = "linux")']`-scoped and
+   the module is `#[cfg(all(target_os = "linux", feature = "io-uring"))]`, so
+   the default build (and macOS) never touches it. **Verify on the Linux NUC:**
+   `cargo test -p ticktape-journal --features io-uring` runs
+   `tests/iouring.rs`, which asserts the io_uring journal is byte-identical to
+   the `RealStorage` one and recovers to the same frames.
+4. **✅ Shared-memory IPC ring — DONE (v0.17.0, feature-gated, verified).**
+   `ticktape-transport`'s `shm` feature adds a lock-free SPSC slot ring over a
+   memory-mapped file (`ShmRing`) plus `ShmSource: PacketSource`, so a
+   co-located consumer (drop-copy auditor, same-box replica, risk gate) reads
+   the sequenced stream from shared memory with no socket round-trip, behind
+   the existing `PacketSource` seam. A full ring drops (the reliable feed
+   still carries the frame) rather than corrupting. Verified on macOS
+   (`cargo test -p ticktape-transport --features shm`): single-process
+   round-trip, full-ring drop, and a cross-thread producer/consumer run.
+   `memmap2` is optional (off by default).
 5. **✅ Streaming replay — DONE.** `Journal::replay_open` streams frames to a
    callback in seq order without materializing `Vec<Frame>` (peak memory =
    one frame + one segment buffer). `verify_replay` uses it, so the

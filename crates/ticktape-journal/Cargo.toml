@@ -10,5 +10,13 @@ rust-version.workspace = true
 [dependencies]
 ticktape-core.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.6", optional = true }
+
+[features]
+# io_uring-backed journal write path (P2 #3), Linux-only. Off by default so
+# the workspace stays dependency-free unless you opt in on Linux.
+io-uring = ["dep:io-uring"]
+
 [dev-dependencies]
 tempfile = "3"

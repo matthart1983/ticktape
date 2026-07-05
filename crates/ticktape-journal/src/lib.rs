@@ -26,9 +26,13 @@
 //! `O_DIRECT`/`io_uring` I/O. Group commit is time-window based via
 //! [`FsyncPolicy::Micros`].
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub mod iouring;
 pub mod snapshot;
 pub mod storage;
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub use iouring::{IoUringFile, IoUringStorage};
 pub use snapshot::{LoadedSnapshot, SnapshotStore};
 pub use storage::{RealStorage, Storage, StorageFile};
 

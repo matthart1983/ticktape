@@ -32,6 +32,8 @@
 pub mod net;
 pub mod reassembler;
 pub mod replica;
+#[cfg(feature = "shm")]
+pub mod shm;
 pub mod wire;
 
 pub use net::{
@@ -40,6 +42,8 @@ pub use net::{
 };
 pub use reassembler::Reassembler;
 pub use replica::Replica;
+#[cfg(feature = "shm")]
+pub use shm::{ShmRing, ShmSource};
 pub use wire::{Packet, MAX_PACKET_BYTES};
 
 use std::fmt;
