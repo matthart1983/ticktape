@@ -335,9 +335,11 @@ leader, promotes a follower, and the promoted leader resumes with the exact
 pre-failover state and no committed loss. What remains is audited in
 [BACKLOG.md](BACKLOG.md): automatic failure detection (Stage B — promotion
 is manual today, a deliberate posture), full Tier-2 deferred-ack
-enforcement in the runtime, an admin/observability plane, offline-session
+enforcement in the runtime, offline-session
 event replay, and the async group-commit/`io_uring` performance workstream.
-The API will still move.
+Operators get a Prometheus `/metrics` endpoint per server (role, replication
+lag, snapshot seq, disk) to watch a deployment and drive failover. The API
+will still move.
 
 | Milestone | Scope | Status |
 |---|---|---|
