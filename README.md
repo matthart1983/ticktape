@@ -332,10 +332,15 @@ with no restart or day-roll. The no-single-point-of-failure story is now real to
 `ticktape-server` deployment (leader + follower replicas, each journaling
 the stream) survives an operator-driven failover — a 3-node test kills the
 leader, promotes a follower, and the promoted leader resumes with the exact
-pre-failover state and no committed loss. What remains is audited in
+pre-failover state and no committed loss. The runtime enforces Tier-2 quorum commit directly: a leader `Node` in
+quorum mode withholds an input's outputs until a majority has durably
+journaled it, releasing them at the commit watermark as follower acks
+arrive — proven by a 300-seed differential simulation against the runtime's
+own machinery plus a 200-seed crash run showing no committed output is lost
+across power loss. What remains is audited in
 [BACKLOG.md](BACKLOG.md): automatic failure detection (Stage B — promotion
-is manual today, a deliberate posture), full Tier-2 deferred-ack
-enforcement in the runtime, offline-session
+is manual today, a deliberate posture), wiring that deferred-ack mode to a
+live follower ack channel in the packaged server, offline-session
 event replay, and the async group-commit/`io_uring` performance workstream.
 Operators get a Prometheus `/metrics` endpoint per server (role, replication
 lag, snapshot seq, disk) to watch a deployment and drive failover. The API

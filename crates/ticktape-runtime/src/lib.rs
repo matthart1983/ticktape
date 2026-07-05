@@ -24,6 +24,7 @@
 //! completion per input); concurrency belongs at the edges, not in the
 //! state machine.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -122,6 +123,31 @@ pub struct NodeConfig {
     /// 24×7 operation possible — without it, disk grows without bound.
     /// Ignored when `snapshot_every` is `None`.
     pub retain_snapshots: usize,
+    /// Tier-2 quorum commit. `None` (the default) is Tier 0/1: outputs are
+    /// released the moment they are sequenced. `Some(_)` makes this a
+    /// leader whose outputs are *withheld* until a majority of the replica
+    /// set has durably journaled the input (see [`CommitConfig`] and
+    /// [`Node::record_ack`]).
+    pub commit: Option<CommitConfig>,
+}
+
+/// Tier-2 quorum-commit configuration for a leader [`Node`].
+///
+/// A replica's journal is a gapless prefix of the stream, so one high-water
+/// seq per replica fully describes what it holds durably. The commit
+/// watermark is the majority-th highest of those high-waters: at least a
+/// majority hold everything up to it, so it can never be lost to a single
+/// failure, and any two majorities intersect ⇒ a committed input survives
+/// every future election.
+#[derive(Debug, Clone)]
+pub struct CommitConfig {
+    /// Total voters in the replica set, **including this leader**. The
+    /// watermark needs `voters / 2 + 1` durable copies.
+    pub voters: usize,
+    /// This leader's own replica id, distinct from every follower id passed
+    /// to [`Node::record_ack`]. The leader journals a frame *before* it
+    /// applies it, so it counts as one durable voter of itself.
+    pub self_replica: u32,
 }
 
 impl NodeConfig {
@@ -131,7 +157,86 @@ impl NodeConfig {
             stream_id: 1,
             snapshot_every: None,
             retain_snapshots: 2,
+            commit: None,
         }
+    }
+
+    /// Make this node a Tier-2 quorum-commit leader with the given replica
+    /// set size and own replica id. Chainable on top of [`NodeConfig::new`].
+    pub fn with_quorum(mut self, voters: usize, self_replica: u32) -> Self {
+        self.commit = Some(CommitConfig {
+            voters,
+            self_replica,
+        });
+        self
+    }
+}
+
+/// The leader's live view of quorum commit: which replicas hold what, the
+/// buffered-but-uncommitted outputs, and the watermark below which they are
+/// safe to release. Present only on a Tier-2 leader.
+struct CommitState<O> {
+    voters: usize,
+    self_replica: u32,
+    /// Last contiguously-journaled seq per replica (leader included).
+    high_waters: BTreeMap<u32, Seq>,
+    /// Outputs of applied inputs, withheld until their seq is committed.
+    /// Keyed by seq so a watermark advance drains a contiguous prefix.
+    pending: BTreeMap<Seq, Vec<O>>,
+    /// Highest seq released so far (monotonic).
+    committed: Seq,
+}
+
+impl<O> CommitState<O> {
+    fn new(config: &CommitConfig, self_seq: Seq) -> Self {
+        let mut high_waters = BTreeMap::new();
+        // Seed the leader's own high-water at its recovered tip: it already
+        // holds everything it sequenced, so the first follower ack can form
+        // a majority over the recovered prefix immediately.
+        high_waters.insert(config.self_replica, self_seq);
+        CommitState {
+            voters: config.voters,
+            self_replica: config.self_replica,
+            high_waters,
+            pending: BTreeMap::new(),
+            committed: self_seq,
+        }
+    }
+
+    /// Record that `replica` has durably journaled everything up to `seq`
+    /// (monotonic — a stale ack never regresses a replica's high-water).
+    fn record(&mut self, replica: u32, seq: Seq) {
+        let entry = self.high_waters.entry(replica).or_insert(Seq::GENESIS);
+        *entry = (*entry).max(seq);
+    }
+
+    /// The majority-th highest high-water — the highest seq a majority holds.
+    fn watermark(&self) -> Seq {
+        let needed = self.voters / 2 + 1;
+        if self.high_waters.len() < needed {
+            return Seq::GENESIS;
+        }
+        let mut waters: Vec<Seq> = self.high_waters.values().copied().collect();
+        waters.sort_unstable_by(|a, b| b.cmp(a)); // descending
+        waters[needed - 1]
+    }
+
+    /// Advance `committed` to the current watermark and drain every pending
+    /// entry that crossed it, in seq order. Returns the released outputs.
+    fn drain_committed(&mut self) -> Vec<(Seq, Vec<O>)> {
+        let mark = self.watermark();
+        if mark <= self.committed {
+            return Vec::new();
+        }
+        self.committed = mark;
+        let mut released = Vec::new();
+        // Split off everything <= mark. BTreeMap keeps seq order.
+        let above = self.pending.split_off(&mark.next());
+        let below = std::mem::replace(&mut self.pending, above);
+        for (seq, outputs) in below {
+            released.push((seq, outputs));
+        }
+        released
     }
 }
 
@@ -190,6 +295,8 @@ pub struct Node<S: Service, T: TimeSource = WallClock, St: Storage + Clone = Rea
     outputs: OutBuf<S::Output>,
     bus: InProcBus,
     recovery: RecoveryInfo,
+    /// Tier-2 quorum-commit state; `None` on a Tier 0/1 node.
+    commit: Option<CommitState<S::Output>>,
 }
 
 impl<S: Service> Node<S, WallClock> {
@@ -296,6 +403,10 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         }
 
         let seq = recovered_tip;
+        let commit = config
+            .commit
+            .as_ref()
+            .map(|c| CommitState::new(c, seq));
         Ok(Node {
             service,
             service_config,
@@ -315,14 +426,26 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
                 snapshot_seq,
                 inputs_replayed,
             },
+            commit,
         })
     }
 
     /// Sequence, journal, and apply one input. Returns the assigned seq and
-    /// the outputs the service emitted.
+    /// the outputs the caller may now release.
     ///
     /// The frame is journaled *before* `apply` runs: an input either exists
     /// durably in the total order or it never happened.
+    ///
+    /// **Tier 0/1** (no [`CommitConfig`]): the returned outputs are exactly
+    /// this input's outputs — released the instant it is sequenced.
+    ///
+    /// **Tier 2** (quorum commit): this input's outputs are *withheld* until
+    /// a majority of the replica set has durably journaled it. The returned
+    /// vector is instead whatever outputs crossed the commit watermark *as a
+    /// result of this call* — normally empty here (the leader's own ack is
+    /// only one voter), later released by [`Node::record_ack`] as followers
+    /// report progress. With a single voter the input commits immediately
+    /// and its outputs come back here.
     pub fn submit(&mut self, input: S::Input) -> Result<(Seq, Vec<S::Output>), NodeError> {
         let frame = self.sequence(FrameKind::Input, encode_to_vec(&input))?;
         let mut ctx = Ctx::new(frame.seq, frame.timestamp, &mut self.outputs);
@@ -330,7 +453,55 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         let outputs = self.outputs.drain();
         self.bus.publish(&frame);
         self.maybe_snapshot(frame.seq)?;
-        Ok((frame.seq, outputs))
+        match &mut self.commit {
+            None => Ok((frame.seq, outputs)),
+            Some(state) => {
+                state.pending.insert(frame.seq, outputs);
+                let me = state.self_replica;
+                state.record(me, frame.seq);
+                let released = state
+                    .drain_committed()
+                    .into_iter()
+                    .flat_map(|(_, outs)| outs)
+                    .collect();
+                Ok((frame.seq, released))
+            }
+        }
+    }
+
+    /// Record that follower `replica` has durably journaled everything up to
+    /// `seq`. On a Tier-2 leader this may advance the commit watermark and
+    /// release buffered outputs; the returned pairs are the newly-committed
+    /// `(seq, outputs)` in seq order. A no-op (empty) on a Tier 0/1 node.
+    ///
+    /// `replica` must differ from the leader's own [`CommitConfig::self_replica`];
+    /// the leader records itself automatically on each [`Node::submit`].
+    pub fn record_ack(&mut self, replica: u32, seq: Seq) -> Vec<(Seq, Vec<S::Output>)> {
+        match &mut self.commit {
+            None => Vec::new(),
+            Some(state) => {
+                state.record(replica, seq);
+                state.drain_committed()
+            }
+        }
+    }
+
+    /// The commit watermark: the highest seq whose outputs have been
+    /// released. On a Tier-2 leader this trails [`Node::seq`] until a
+    /// majority acks; on a Tier 0/1 node everything is committed on submit,
+    /// so this equals [`Node::seq`].
+    pub fn commit_watermark(&self) -> Seq {
+        match &self.commit {
+            Some(state) => state.committed,
+            None => self.seq,
+        }
+    }
+
+    /// Outputs currently withheld pending quorum (Tier-2 leader only). A
+    /// gauge of in-flight, uncommitted work — the basis for edge flow
+    /// control (throttle new inputs when this grows). `0` on a Tier 0/1 node.
+    pub fn pending_commit_count(&self) -> usize {
+        self.commit.as_ref().map_or(0, |s| s.pending.len())
     }
 
     /// Inject a sequenced `Tick`, advancing deterministic time for all
@@ -340,6 +511,7 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         let seq = frame.seq;
         self.bus.publish(&frame);
         self.maybe_snapshot(seq)?;
+        self.note_self_progress(seq);
         Ok(seq)
     }
 
@@ -356,7 +528,20 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         let seq = frame.seq;
         self.bus.publish(&frame);
         self.maybe_snapshot(seq)?;
+        self.note_self_progress(seq);
         Ok(seq)
+    }
+
+    /// A Tier-2 leader durably holds every frame it sequences, so any
+    /// non-`Input` frame (tick, fence, snapshot mark) still advances its own
+    /// high-water — otherwise the watermark would stall behind the last
+    /// application input. No pending outputs attach to these, so this never
+    /// releases anything on its own.
+    fn note_self_progress(&mut self, seq: Seq) {
+        if let Some(state) = &mut self.commit {
+            let me = state.self_replica;
+            state.record(me, seq);
+        }
     }
 
     /// Snapshot on cadence: state at `seq` is durably written *before* the

@@ -16,7 +16,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "counter"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "ticktape",
  "ticktape-core",
@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "exchange"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "orderbook",
  "tempfile",
@@ -52,7 +52,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "feed"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "ticktape",
  "ticktape-journal",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "kv"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "tempfile",
  "ticktape",
@@ -101,7 +101,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "orderbook"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "tempfile",
  "ticktape",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "ticktape-cluster",
  "ticktape-codec",
@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape-bench"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "tempfile",
  "ticktape-core",
@@ -197,19 +197,20 @@ dependencies = [
 
 [[package]]
 name = "ticktape-cluster"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "tempfile",
  "ticktape-codec",
  "ticktape-core",
  "ticktape-journal",
+ "ticktape-runtime",
  "ticktape-sim",
  "ticktape-transport",
 ]
 
 [[package]]
 name = "ticktape-codec"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "ticktape-core",
  "ticktape-macros",
@@ -217,11 +218,11 @@ dependencies = [
 
 [[package]]
 name = "ticktape-core"
-version = "0.10.0"
+version = "0.12.0"
 
 [[package]]
 name = "ticktape-gateway"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "tempfile",
  "ticktape-codec",
@@ -232,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape-journal"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "tempfile",
  "ticktape-core",
@@ -240,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape-macros"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -249,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape-runtime"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "tempfile",
  "ticktape-codec",
@@ -259,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape-server"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "tempfile",
  "ticktape-cluster",
@@ -272,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape-sim"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "ticktape-codec",
  "ticktape-core",
@@ -282,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "ticktape-transport"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "tempfile",
  "ticktape-core",

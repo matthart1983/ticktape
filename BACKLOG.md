@@ -84,9 +84,10 @@ without a majority is refused. Acceptor `promised` is durable (v0.9.0).
 Deferred within Stage A: a caught-up-shortfall winner fetching the gap
 from a peer before leading (test keeps followers caught up); a packaged
 multi-process binary + gateway wiring (the library composes; the demo
-binary is a thin wrapper); full Tier-2 deferred-ack enforcement in the
-runtime (P1.3) so "no committed loss" is enforced by the runtime, not
-just held by caught-up replicas.
+binary is a thin wrapper); wiring the leader's now-built Tier-2
+deferred-ack mode (P1.3, done) to a live follower→leader ack channel so
+"no committed loss" is enforced by the runtime end-to-end, not just held
+by caught-up replicas.
 
 **Stage B — open.** A failure detector (missed-heartbeat count over the
 existing transport heartbeats) that maintains `leader_hint` and triggers
@@ -121,19 +122,31 @@ the gap on reconnect; drop-copy can join from any point. Covered by an e2e
 test that kills a client, trades against its book, reconnects, and sees
 the missed fills.
 
-### 3. Tier 2 in the runtime: deferred acks
-`CommitTracker` exists; `Node` doesn't use it. Quorum commit requires
-splitting `submit` into sequence/journal (returns pending handle) and a
-commit watermark that releases outputs + acks. This is also what makes
-gateway flow-control windows real (today `SessionFlow` windows are
-correct and unit-tested, but the live server acks synchronously inside
-`submit`, so `outstanding` never exceeds 1 and `Throttled` is unreachable
-— a documented no-op until this lands) and unlocks genuine group-commit
-batching (P2.1) — three gaps, one architectural change.
-**Done means:** a `Node` mode where outputs/acks release at the commit
-watermark, exercised by the cluster sim invariants against the *runtime*
-rather than the test harness's own bookkeeping. Until then, the server
-config states plainly that window > 1 has no effect in synchronous mode.
+### ✅ 3. Tier 2 in the runtime: deferred acks — DONE (v0.12.0)
+The `Node` now has a quorum-commit mode (`NodeConfig::with_quorum(voters,
+self_replica)` / `CommitConfig`). In that mode `submit` journals + applies
+but *withholds* the outputs, recording only the leader's own durable
+high-water; `record_ack(follower, seq)` advances a majority commit
+watermark that releases the buffered `(seq, outputs)` in seq order.
+`commit_watermark()` and `pending_commit_count()` expose the state (the
+latter is the basis for edge flow control). Tier 0/1 nodes are unchanged —
+`submit` still returns outputs synchronously when no `CommitConfig` is set.
+**Verified:** unit tests for the release semantics (withhold until
+majority, single-voter fast path, stale-ack monotonicity, minority never
+commits, ticks advance the leader high-water); and a deterministic
+differential simulation (`ticktape-cluster/tests/quorum_commit_sim.rs`,
+300 seeds) that drives a real runtime `Node` in quorum mode on the
+fault-injecting `SimStorage` and cross-checks its watermark + exact
+released set against an independent reference model — *the runtime's own
+machinery, not the harness's bookkeeping* — plus a 200-seed crash run
+proving no committed output is lost or resurrected across power loss.
+**Remaining as a follow-up (the live wiring):** feeding `record_ack` from
+a real follower→leader ack channel in the packaged server (needs the
+Stage-A ack back-channel), which is what finally makes the gateway's
+`SessionFlow` window > 1 exceed one outstanding in the *live* server
+(`Throttled` reachable end-to-end) and unlocks group-commit batching
+(P2.1). The runtime mechanism those depend on now exists and is proven;
+only the transport plumbing remains.
 
 ### 4. Deterministic timers (capability gap — from the core/Coral review)
 Services can read sequenced time but cannot schedule against it: there is

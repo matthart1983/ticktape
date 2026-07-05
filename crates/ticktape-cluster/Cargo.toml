@@ -14,5 +14,6 @@ ticktape-journal.workspace = true
 
 [dev-dependencies]
 ticktape-sim.workspace = true
+ticktape-runtime.workspace = true
 ticktape-codec.workspace = true
 tempfile = "3"
