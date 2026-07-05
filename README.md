@@ -328,12 +328,16 @@ big "does it run forever" gap is closed: journal compaction + snapshot
 pruning bound disk, a bounded repeater / journal-backed rewinder bound
 retransmit memory, and recovery leans on snapshots when history is
 compacted away — all fault-injection-verified, so a node runs 24×7/365
-with no restart or day-roll. What remains is audited honestly in
-[BACKLOG.md](BACKLOG.md): the no-single-point-of-failure *packaged*
-replicated server (the machinery is simulation-proven but not yet wired
-to live sockets), an admin/observability plane, offline-session event
-replay, and the async group-commit/`io_uring` performance workstream. The
-API will still move.
+with no restart or day-roll. The no-single-point-of-failure story is now real too: a
+`ticktape-server` deployment (leader + follower replicas, each journaling
+the stream) survives an operator-driven failover — a 3-node test kills the
+leader, promotes a follower, and the promoted leader resumes with the exact
+pre-failover state and no committed loss. What remains is audited in
+[BACKLOG.md](BACKLOG.md): automatic failure detection (Stage B — promotion
+is manual today, a deliberate posture), full Tier-2 deferred-ack
+enforcement in the runtime, an admin/observability plane, offline-session
+event replay, and the async group-commit/`io_uring` performance workstream.
+The API will still move.
 
 | Milestone | Scope | Status |
 |---|---|---|

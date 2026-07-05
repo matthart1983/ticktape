@@ -28,7 +28,7 @@ and the feed example ran to seq 1,400 on one segment + two snapshots with a
 late joiner backfilling from disk. **A node now runs 24×7/365 with no
 restart or day-roll.**
 
-### 1. No single point of failure — the replicated deployment  (top open item)
+### ◑ 1. No single point of failure — Stage A DONE (v0.10.0), Stage B open
 "The sequencer needs several running at the same time; the journal also
 needs several running, replicated, so that all the single points of
 failure are removed." In this architecture a *replicated journal* is not
@@ -74,11 +74,25 @@ Missing pieces, in dependency order:
   forced), adopt the feed publisher role, emit `EpochChange`, gateway
   fail-over of client connections.
 
-**Done means (Stage A):** operator-promoted failover of a 3-node exchange
-deployment with no committed loss (Tier 2) and clients resuming sessions.
-**Done means (Stage B):** `kill -9` the leader; a standby promotes within
-the heartbeat timeout; the cluster sim's invariants hold on the real
-deployment's journals afterwards.
+**Stage A — DONE (v0.10.0).** `ticktape-server::Server` (Leader/Follower
+over real UDP feed + TCP votes/retransmit) with `promote()` = election +
+reconcile + open Node on the local journal + fence + become leader.
+Verified: a 3-node Bank deployment on loopback fails over on operator
+promotion with the promoted leader holding the exact pre-failover state
+(no committed loss) and the surviving follower tracking it; promotion
+without a majority is refused. Acceptor `promised` is durable (v0.9.0).
+Deferred within Stage A: a caught-up-shortfall winner fetching the gap
+from a peer before leading (test keeps followers caught up); a packaged
+multi-process binary + gateway wiring (the library composes; the demo
+binary is a thin wrapper); full Tier-2 deferred-ack enforcement in the
+runtime (P1.3) so "no committed loss" is enforced by the runtime, not
+just held by caught-up replicas.
+
+**Stage B — open.** A failure detector (missed-heartbeat count over the
+existing transport heartbeats) that maintains `leader_hint` and triggers
+promotion automatically. **Done means:** `kill -9` the leader; a standby
+promotes within the heartbeat timeout with no operator action; the
+cluster sim's invariants hold on the real deployment's journals.
 
 ## P1 — correctness traps and product machinery
 
