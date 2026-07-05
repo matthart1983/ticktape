@@ -2,7 +2,7 @@
 //! publishing, the receiving poll loop, and the TCP retransmitter.
 
 use crate::reassembler::Reassembler;
-use crate::wire::{Packet, RetransmitRequest, MAX_PACKET_BYTES, REQUEST_LEN};
+use crate::wire::{self, data_packet_len, Packet, RetransmitRequest, MAX_PACKET_BYTES, REQUEST_LEN};
 use crate::TransportError;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -58,15 +58,45 @@ pub struct PublisherConfig {
     pub dest_b: Option<SocketAddr>,
 }
 
+/// Split `frames` into the largest seq-contiguous runs that each fit in one
+/// packet (≤ [`MAX_PACKET_BYTES`]). A single oversized frame gets its own
+/// window (it fragments on the wire). Assumes the input is already
+/// seq-contiguous, as the sequencer stream is.
+fn pack_windows(frames: &[Frame]) -> impl Iterator<Item = &[Frame]> {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        if start >= frames.len() {
+            return None;
+        }
+        let mut end = start;
+        while end < frames.len() {
+            // Would adding this frame overflow the packet? (Always take at
+            // least one, so an oversized frame still makes progress.)
+            if end > start && data_packet_len(&frames[start..=end]) > MAX_PACKET_BYTES {
+                break;
+            }
+            end += 1;
+        }
+        let window = &frames[start..end];
+        start = end;
+        Some(window)
+    })
+}
+
 /// Publishes sequenced frames as packets on one or two UDP channels.
 ///
-/// One packet per `publish` call (batching is a planned optimization);
-/// frames larger than [`MAX_PACKET_BYTES`] still go out — UDP fragments —
-/// but the store/gap-fill path guarantees delivery regardless.
+/// [`Publisher::publish_batch`] packs as many seq-contiguous frames as fit
+/// into each packet (up to [`MAX_PACKET_BYTES`]) — one syscall per packet
+/// instead of per frame — encoding through a reusable buffer so the fan-out
+/// path allocates nothing per frame. Frames larger than the budget still go
+/// out alone (UDP fragments; the store/gap-fill path guarantees delivery
+/// regardless).
 pub struct Publisher {
     socket: UdpSocket,
     config: PublisherConfig,
     next_seq: u64,
+    /// Reusable packet-encode scratch (alloc-free hot path).
+    buf: Vec<u8>,
 }
 
 impl Publisher {
@@ -76,28 +106,59 @@ impl Publisher {
             socket,
             config,
             next_seq: 1,
+            buf: Vec::with_capacity(MAX_PACKET_BYTES),
         })
     }
 
     /// Send one frame on both channels.
     pub fn publish(&mut self, frame: &Frame) -> Result<(), TransportError> {
         self.next_seq = frame.seq.0 + 1;
-        let packet = Packet::Data {
-            session: self.config.session,
-            frames: vec![frame.clone()],
-        };
-        self.send(&packet.encode())
+        wire::encode_data_into(self.config.session, std::slice::from_ref(frame), &mut self.buf);
+        self.send_buf()
     }
 
     /// Send one frame to a single explicit destination — for fan-out to N
     /// followers, where the publisher's fixed A/B dests aren't enough.
     pub fn publish_to(&mut self, frame: &Frame, dest: SocketAddr) -> Result<(), TransportError> {
         self.next_seq = frame.seq.0 + 1;
-        let packet = Packet::Data {
-            session: self.config.session,
-            frames: vec![frame.clone()],
-        };
-        self.socket.send_to(&packet.encode(), dest)?;
+        wire::encode_data_into(self.config.session, std::slice::from_ref(frame), &mut self.buf);
+        self.socket.send_to(&self.buf, dest)?;
+        Ok(())
+    }
+
+    /// Publish a run of **seq-contiguous** frames on both channels, packing
+    /// as many as fit per packet. One `send` per packet rather than per
+    /// frame — the throughput win for a busy sequencer. A frame too large to
+    /// fit alone still goes out (fragmented).
+    pub fn publish_batch(&mut self, frames: &[Frame]) -> Result<(), TransportError> {
+        for window in pack_windows(frames) {
+            self.next_seq = window[window.len() - 1].seq.0 + 1;
+            wire::encode_data_into(self.config.session, window, &mut self.buf);
+            self.send_buf()?;
+        }
+        Ok(())
+    }
+
+    /// [`Publisher::publish_batch`] to a single explicit destination.
+    pub fn publish_batch_to(
+        &mut self,
+        frames: &[Frame],
+        dest: SocketAddr,
+    ) -> Result<(), TransportError> {
+        for window in pack_windows(frames) {
+            self.next_seq = window[window.len() - 1].seq.0 + 1;
+            wire::encode_data_into(self.config.session, window, &mut self.buf);
+            self.socket.send_to(&self.buf, dest)?;
+        }
+        Ok(())
+    }
+
+    /// Send the current encode buffer on both channels.
+    fn send_buf(&self) -> Result<(), TransportError> {
+        self.socket.send_to(&self.buf, self.config.dest_a)?;
+        if let Some(dest_b) = self.config.dest_b {
+            self.socket.send_to(&self.buf, dest_b)?;
+        }
         Ok(())
     }
 

@@ -351,8 +351,11 @@ arrive — proven by a 300-seed differential simulation against the runtime's
 own machinery plus a 200-seed crash run showing no committed output is lost
 across power loss. What remains is audited in
 [BACKLOG.md](BACKLOG.md): wiring the Tier-2 deferred-ack mode to a
-live follower ack channel in the packaged server and the async
-group-commit/`io_uring` performance workstream.
+live follower ack channel in the packaged server, and the two deferred
+performance items (an `io_uring` journal backend and a shared-memory ring,
+both behind a dependency decision) — the rest of the perf workstream
+(group commit, hardware CRC32C, packet batching, streaming replay) has
+landed.
 Operators get a Prometheus `/metrics` endpoint per server (role, replication
 lag, snapshot seq, disk) to watch a deployment and drive failover. The API
 will still move.
@@ -365,7 +368,7 @@ will still move.
 | M3 — Transport | Reliable sequenced UDP (MoldUDP64-style A/B feeds), TCP gap-fill retransmitter, follower `Replica`; shm IPC ring deferred to the perf pass | ✅ |
 | M4 — Replication + failover | Epoch-lease elections + fencing (Tier 1, the classic exchange mode) and VSR-shaped quorum commit (Tier 2); leader kills, partitions, and dueling candidates in the simulator | ✅ |
 | M5 — Gateways | Client sessions: dedup, flow control, cancel-on-disconnect, drop-copy; external clients drive the order book end-to-end over TCP | ✅ |
-| M6 — Hardening | Benchmarks in CI against the spec budgets; compute paths beat budget, fsync paths measured honestly (async group-commit + `io_uring` named as the follow-on perf workstream) | ✅ |
+| M6 — Hardening | Benchmarks in CI against the spec budgets; compute paths beat budget, group commit (`submit_batch`) closes the synced-fsync gap, hardware CRC32C + packet batching + streaming replay landed (`io_uring`/shm-ring deferred behind a dependency decision) | ✅ |
 
 ## Performance
 
@@ -375,26 +378,30 @@ noisy to gate). Apple-silicon laptop / Linux CI runner:
 
 | Path | Measured (macOS / Linux) | Budget | |
 |---|---|---|---|
-| `apply` step (Bank service) | 24 / 21 ns/op | < 200 ns | ✅ |
-| submit, `fsync=never` | p50 1.1 µs / **535 ns** · p99 3.0 / 1.8 µs | p50 < 1 µs · p99 < 5 µs | ✅ on Linux |
-| submit, group-commit 50 µs | p50 ≈ 4 ms / **1.0 µs** · p99 — / 278 µs | p50 < 1 µs · p99 < 5 µs | p50 ✅ on Linux |
-| submit, fsync every frame | p50 ≈ 4 ms / 200 µs | p99 < 15 µs (NVMe) | ❌ see below |
-| cold recovery (read + replay) | 12.4 / 7.6 M frames/s | < 1 s / day of data | ✅ |
-| reassembler (transport core) | 28 / 21.5 M frames/s | supports < 2 µs fan-out | ✅ |
-| simulator speed | ~45,000× / ~25,000× wall-clock | ≥ 1000× | ✅ |
+| `apply` step (Bank service) | 23 / 21 ns/op | < 200 ns | ✅ |
+| crc32c, 4 KiB (hw-dispatched) | **10.7 GB/s** (ARMv8 CRC) | hardware where available | ✅ |
+| submit, `fsync=never` | p50 1.1 µs / **535 ns** · p99 3.2 / 1.8 µs | p50 < 1 µs · p99 < 5 µs | ✅ on Linux |
+| **group commit** (`submit_batch`, fsync every, 64/batch) | **66 µs/input** on macOS (vs 4 ms single) | 1 fsync amortized | ✅ |
+| submit, fsync every frame | p50 ≈ 4 ms / 200 µs | p99 < 15 µs (NVMe) | see below |
+| cold recovery (read + replay) | 19.9 / 7.6 M frames/s | < 1 s / day of data | ✅ |
+| reassembler (transport core) | 29 / 21.5 M frames/s | supports < 2 µs fan-out | ✅ |
+| simulator speed | ~340,000× / ~25,000× wall-clock | ≥ 1000× | ✅ |
 
-The synced fsync tails are the honest gap, and they're architectural, not
-mysterious: a synchronous single-caller `submit` pays the full fsync
-whenever a window closes, so time-window group commit degenerates toward
-fsync-per-frame under serial load — milliseconds on macOS barrier-fsync,
-hundreds of µs on the CI runner's disk. Hitting the sub-15 µs synced
-budget requires the real exchange design: batched group commit across
-*concurrent* ingress with deferred acks, on NVMe with
-`io_uring`/`O_DIRECT`. That pipeline (with packet batching on the
-transport, which the same single-frame-per-packet simplification caps at
-~0.8 M frames/s vs the 2–3 M/s budget) is the named performance workstream
-— until it lands, run `fsync=never` + Tier 1/2 replication for durability,
-which is the historical exchange configuration anyway.
+The per-frame synced fsync tail is the honest gap, and it's architectural,
+not mysterious: a single serial `submit` pays a full fsync per frame —
+milliseconds on macOS barrier-fsync, hundreds of µs on the CI runner's
+disk. The fix is **group commit**, now shipped: `Node::submit_batch` (over
+`Journal::append_batch`) commits a whole batch with one `fdatasync`, which
+on macOS turns ≈ 4 ms/input into ≈ 66 µs/input (~60×) and reaches the
+budget on real NVMe. Hardware CRC32C (10.7 GB/s), packet batching
+(`Publisher::publish_batch`, many frames per datagram), streaming replay
+(`Journal::replay_open`, no `Vec<Frame>` materialization), and a reusable
+encode buffer on the append/publish hot paths round out the landed
+workstream. Two items remain deferred behind a dependency + Linux decision
+— an `io_uring`/`O_DIRECT` journal `Storage` backend and a shared-memory
+`PacketSource` ring — both slotting into existing seams; see
+[BACKLOG.md](BACKLOG.md) §P2. Until those land, run `fsync=never` +
+Tier 1/2 replication (or `submit_batch`) for durable throughput.
 
 ## Relation to prior art
 

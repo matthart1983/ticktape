@@ -51,7 +51,7 @@ pub use ticktape_core::{
 // Trait + derive macro under one name each (serde-style).
 pub use ticktape_cluster::{Acceptor, CommitTracker, Election, ElectionOutcome, EpochChange, Tier};
 pub use ticktape_codec::{Decode, Encode};
-pub use ticktape_journal::{FsyncPolicy, Journal, JournalConfig, JournalError, Recovered};
+pub use ticktape_journal::{FsyncPolicy, Journal, JournalConfig, JournalError, Recovered, ReplayMeta};
 pub use ticktape_runtime::{
     InProcBus, ManualClock, Node, NodeConfig, NodeError, RecoveryInfo, TimeSource, WallClock,
 };

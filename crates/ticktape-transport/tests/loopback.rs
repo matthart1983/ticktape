@@ -82,6 +82,37 @@ fn ab_redundancy_covers_single_channel_loss() {
 }
 
 #[test]
+fn batched_publish_packs_many_frames_and_reassembles_in_order() {
+    // The batching publisher must deliver a contiguous run intact and in
+    // order, packing multiple frames per packet (fewer datagrams than
+    // frames) while still reassembling to the exact sequence.
+    let sock_a = bind_udp((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let addr_a = localhost(&sock_a);
+
+    let mut publisher = Publisher::new(PublisherConfig {
+        session: SESSION,
+        dest_a: addr_a,
+        dest_b: None,
+    })
+    .unwrap();
+
+    // 200 small frames: at ~50 bytes each and a 1400-byte budget, this packs
+    // into well under 200 packets — proving batching actually batches.
+    let frames: Vec<_> = (1..=200u64).map(frame).collect();
+    publisher.publish_batch(&frames).unwrap();
+
+    let mut receiver = Receiver::new(
+        sock_a,
+        None,
+        ReceiverConfig {
+            from: Seq(1),
+            retransmitter: None,
+        },
+    );
+    assert_eq!(drain(&mut receiver, 200), (1..=200).collect::<Vec<_>>());
+}
+
+#[test]
 fn gap_fill_recovers_frames_lost_on_both_channels() {
     let sock_a = bind_udp((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     let addr_a = localhost(&sock_a);

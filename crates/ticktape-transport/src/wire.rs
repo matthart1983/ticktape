@@ -58,25 +58,15 @@ impl Packet {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let (kind, count, first_seq, frames): (u8, u16, u64, &[Frame]) = match self {
-            Packet::Data { frames, .. } => {
+        let mut out = Vec::new();
+        match self {
+            Packet::Data { session, frames } => {
                 debug_assert!(!frames.is_empty(), "data packet must carry frames");
-                (KIND_DATA, frames.len() as u16, frames[0].seq.0, frames)
+                encode_data_into(*session, frames, &mut out);
             }
-            Packet::Heartbeat { next_seq, .. } => (KIND_HEARTBEAT, 0, next_seq.0, &[]),
-        };
-        let mut out = Vec::with_capacity(
-            PACKET_HEADER_LEN + frames.iter().map(Frame::encoded_len).sum::<usize>(),
-        );
-        out.extend_from_slice(PACKET_MAGIC);
-        out.push(kind);
-        out.extend_from_slice(&count.to_le_bytes());
-        out.extend_from_slice(&self.session().to_le_bytes());
-        out.extend_from_slice(&first_seq.to_le_bytes());
-        let crc = crc32c(&out[0..23]);
-        out.extend_from_slice(&crc.to_le_bytes());
-        for frame in frames {
-            frame.write_to(&mut out);
+            Packet::Heartbeat { session, next_seq } => {
+                encode_header_into(KIND_HEARTBEAT, 0, *session, next_seq.0, &mut out);
+            }
         }
         out
     }
@@ -123,6 +113,38 @@ impl Packet {
             _ => Err(TransportError::Corrupt("unknown packet kind")),
         }
     }
+}
+
+/// The header size of a data packet carrying `frames` — how the batching
+/// publisher decides how many contiguous frames fit in one packet.
+pub fn data_packet_len(frames: &[Frame]) -> usize {
+    PACKET_HEADER_LEN + frames.iter().map(Frame::encoded_len).sum::<usize>()
+}
+
+/// Encode a data packet for a run of seq-contiguous `frames` directly into
+/// `out` (cleared first) — no intermediate allocation, so the publisher can
+/// reuse one buffer across packets (the alloc-free fan-out path).
+pub fn encode_data_into(session: u64, frames: &[Frame], out: &mut Vec<u8>) {
+    debug_assert!(!frames.is_empty(), "data packet must carry frames");
+    out.clear();
+    out.reserve(data_packet_len(frames));
+    encode_header_into(KIND_DATA, frames.len() as u16, session, frames[0].seq.0, out);
+    for frame in frames {
+        frame.write_to(out);
+    }
+}
+
+/// Write the 27-byte packet header (magic, kind, count, session, first_seq,
+/// header CRC) into `out`, appending.
+fn encode_header_into(kind: u8, count: u16, session: u64, first_seq: u64, out: &mut Vec<u8>) {
+    let start = out.len();
+    out.extend_from_slice(PACKET_MAGIC);
+    out.push(kind);
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&session.to_le_bytes());
+    out.extend_from_slice(&first_seq.to_le_bytes());
+    let crc = crc32c(&out[start..start + 23]);
+    out.extend_from_slice(&crc.to_le_bytes());
 }
 
 /// A retransmit range request.

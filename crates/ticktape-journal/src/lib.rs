@@ -149,13 +149,26 @@ impl From<std::io::Error> for JournalError {
 /// every intact frame for replay.
 pub struct Recovered<St: Storage = RealStorage> {
     pub journal: Journal<St>,
-    /// All journaled frames in seq order. (M0 materializes them; a
-    /// streaming replay iterator is planned once volumes demand it.)
+    /// All journaled frames in seq order, materialized. For memory-bounded
+    /// recovery on a large journal, prefer [`Journal::replay_open`], which
+    /// streams frames to a callback and never builds this `Vec`.
     pub frames: Vec<Frame>,
     /// The seq of the first frame the journal holds. `Seq(1)` for an
     /// uncompacted journal; greater after compaction — the caller must
     /// have a snapshot covering everything before it.
     pub first_seq: Seq,
+    /// Whether a torn tail was detected and truncated during recovery.
+    pub truncated_torn_tail: bool,
+}
+
+/// Metadata from a [`Journal::replay_open`] streaming recovery — everything
+/// [`Recovered`] carries except the materialized frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayMeta {
+    /// Seq of the first frame the journal holds (see [`Recovered::first_seq`]).
+    pub first_seq: Seq,
+    /// Seq of the last frame the journal holds (`first_seq - 1` if empty).
+    pub last_seq: Seq,
     /// Whether a torn tail was detected and truncated during recovery.
     pub truncated_torn_tail: bool,
 }
@@ -170,6 +183,9 @@ pub struct Journal<St: Storage = RealStorage> {
     epoch: u64,
     last_sync: Instant,
     dirty: bool,
+    /// Reusable encode buffer so `append`/`append_batch` don't allocate a
+    /// fresh `Vec` per frame on the hot path (the alloc-free journal path).
+    scratch: Vec<u8>,
 }
 
 struct OpenSegment<F> {
@@ -197,6 +213,40 @@ impl<St: Storage> Journal<St> {
     /// snapshot is the caller's responsibility ([`Recovered::first_seq`]
     /// says where the journal starts).
     pub fn open_with(config: JournalConfig, storage: St) -> Result<Recovered<St>, JournalError> {
+        let mut frames = Vec::new();
+        let (journal, meta) = Self::open_inner(config, storage, |frame| frames.push(frame))?;
+        Ok(Recovered {
+            journal,
+            frames,
+            first_seq: meta.first_seq,
+            truncated_torn_tail: meta.truncated_torn_tail,
+        })
+    }
+
+    /// **Streaming recovery.** Invoke `on_frame` for each intact frame in seq
+    /// order *without* materializing them, returning the tail-positioned
+    /// writer plus recovery metadata. Peak memory is one frame + one segment
+    /// buffer, independent of journal length — the caller (crash recovery
+    /// replay, `verify_replay`) applies each frame as it arrives instead of
+    /// holding the whole `Vec<Frame>`.
+    pub fn replay_open(
+        config: JournalConfig,
+        storage: St,
+        on_frame: impl FnMut(Frame),
+    ) -> Result<(Journal<St>, ReplayMeta), JournalError> {
+        Self::open_inner(config, storage, on_frame)
+    }
+
+    /// The shared segment scan behind both [`Journal::open_with`] (which
+    /// collects frames into a `Vec`) and [`Journal::replay_open`] (which
+    /// streams them to a callback). Validates contiguity, truncates a torn
+    /// tail on the final segment, reopens that segment for appending, and
+    /// returns the writer + metadata.
+    fn open_inner(
+        config: JournalConfig,
+        storage: St,
+        mut on_frame: impl FnMut(Frame),
+    ) -> Result<(Journal<St>, ReplayMeta), JournalError> {
         storage.create_dir_all(&config.dir)?;
 
         let mut segment_paths: Vec<PathBuf> = storage
@@ -206,7 +256,8 @@ impl<St: Storage> Journal<St> {
             .collect();
         segment_paths.sort();
 
-        let mut frames = Vec::new();
+        let mut count: u64 = 0;
+        let mut first_seq: Option<Seq> = None;
         let mut expected_next = Seq::GENESIS.next();
         let mut truncated = false;
         let mut epoch = 0u64;
@@ -245,7 +296,9 @@ impl<St: Storage> Journal<St> {
                             });
                         }
                         expected_next = frame.seq.next();
-                        frames.push(frame);
+                        first_seq.get_or_insert(frame.seq);
+                        count += 1;
+                        on_frame(frame);
                     }
                     Err(err) if is_last => {
                         // Torn tail: keep the intact prefix, truncate the rest.
@@ -266,12 +319,8 @@ impl<St: Storage> Journal<St> {
         }
 
         let last_seq = Seq(expected_next.0.saturating_sub(1));
-        let first_seq = match frames.first() {
-            Some(frame) => frame.seq,
-            // Empty journal (no segments, or a single frameless segment):
-            // history "starts" at whatever would come next.
-            None => Seq(last_seq.0 + 1),
-        };
+        // Empty journal: history "starts" at whatever would come next.
+        let first_seq = first_seq.unwrap_or(Seq(last_seq.0 + 1));
 
         // Re-open the final segment for appending, if any.
         let current = match segment_paths.last() {
@@ -281,26 +330,30 @@ impl<St: Storage> Journal<St> {
                 Some(OpenSegment {
                     file,
                     size,
-                    frames: frames.len() as u64, // only used for roll gating; ≥1 is what matters
+                    frames: count, // only used for roll gating; ≥1 is what matters
                 })
             }
             None => None,
         };
 
-        Ok(Recovered {
-            journal: Journal {
-                config,
-                storage,
-                current,
+        let journal = Journal {
+            config,
+            storage,
+            current,
+            last_seq,
+            epoch,
+            last_sync: Instant::now(),
+            dirty: false,
+            scratch: Vec::new(),
+        };
+        Ok((
+            journal,
+            ReplayMeta {
+                first_seq,
                 last_seq,
-                epoch,
-                last_sync: Instant::now(),
-                dirty: false,
+                truncated_torn_tail: truncated,
             },
-            frames,
-            first_seq,
-            truncated_torn_tail: truncated,
-        })
+        ))
     }
 
     /// Compaction: delete every segment whose frames all have
@@ -417,14 +470,75 @@ impl<St: Storage> Journal<St> {
             self.roll_segment(frame.seq)?;
         }
 
+        // Encode into the reusable scratch buffer, not a fresh Vec.
+        self.scratch.clear();
+        frame.write_to(&mut self.scratch);
         let seg = self.current.as_mut().expect("segment open after roll");
-        let bytes = frame.to_bytes();
-        seg.file.write_all(&bytes)?;
-        seg.size += bytes.len() as u64;
+        seg.file.write_all(&self.scratch)?;
+        seg.size += self.scratch.len() as u64;
         seg.frames += 1;
         self.last_seq = frame.seq;
         self.dirty = true;
 
+        self.maybe_sync()?;
+        Ok(())
+    }
+
+    /// Append a run of **seq-contiguous** frames in one shot: encode them all
+    /// into the reusable buffer, write with a single `write_all`, and apply
+    /// the fsync policy **once** for the whole batch. This is the group-commit
+    /// primitive — a caller that has accumulated concurrent ingress commits
+    /// the window with one write + one `fdatasync` instead of N, which is
+    /// what makes the synced-fsync budget reachable under load. `frames[0].seq`
+    /// must be `last_seq + 1` and the run must be gapless. A batch that would
+    /// overflow the current segment rolls once at its start (batches are far
+    /// smaller than a segment).
+    pub fn append_batch(&mut self, frames: &[Frame]) -> Result<(), JournalError> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        // Validate contiguity up front — either the whole batch lands or none
+        // of it does (we haven't written yet).
+        let mut expected = self.last_seq.next();
+        for frame in frames {
+            if frame.seq != expected {
+                return Err(JournalError::OutOfOrderAppend {
+                    expected,
+                    found: frame.seq,
+                });
+            }
+            expected = frame.seq.next();
+        }
+
+        // Encode the whole batch into the scratch buffer.
+        self.scratch.clear();
+        for frame in frames {
+            frame.write_to(&mut self.scratch);
+        }
+        let batch_len = self.scratch.len() as u64;
+
+        // Roll if the open segment can't hold the batch (or there is none).
+        let needs_roll = match &self.current {
+            None => true,
+            Some(seg) => seg.frames > 0 && seg.size + batch_len > self.config.segment_bytes,
+        };
+        if needs_roll {
+            self.roll_segment(frames[0].seq)?;
+        }
+
+        let seg = self.current.as_mut().expect("segment open after roll");
+        seg.file.write_all(&self.scratch)?;
+        seg.size += batch_len;
+        seg.frames += frames.len() as u64;
+        self.last_seq = frames[frames.len() - 1].seq;
+        self.dirty = true;
+
+        self.maybe_sync()?;
+        Ok(())
+    }
+
+    /// Apply the configured fsync policy after a write.
+    fn maybe_sync(&mut self) -> Result<(), JournalError> {
         match self.config.fsync {
             FsyncPolicy::EveryFrame => self.sync()?,
             FsyncPolicy::Micros(window) => {
@@ -543,6 +657,82 @@ mod tests {
         config.segment_bytes = segment_bytes;
         config.fsync = FsyncPolicy::EveryFrame;
         Journal::open(config).expect("open journal")
+    }
+
+    #[test]
+    fn append_batch_is_byte_identical_to_single_appends() {
+        // A batch write and N single writes must produce the same on-disk
+        // journal — batching is a syscall optimization, not a format change.
+        let single = tempfile::tempdir().unwrap();
+        let batched = tempfile::tempdir().unwrap();
+        let frames: Vec<Frame> = (1..=50u64)
+            .map(|i| frame(i, format!("p-{i}").as_bytes()))
+            .collect();
+        {
+            let mut rec = open(single.path(), 1 << 20);
+            for f in &frames {
+                rec.journal.append(f).unwrap();
+            }
+        }
+        {
+            let mut rec = open(batched.path(), 1 << 20);
+            rec.journal.append_batch(&frames).unwrap();
+            assert_eq!(rec.journal.last_seq(), Seq(50));
+        }
+        let a = std::fs::read(single.path().join(format!("{:020}.seg", 1))).unwrap();
+        let b = std::fs::read(batched.path().join(format!("{:020}.seg", 1))).unwrap();
+        assert_eq!(a, b, "batched journal bytes differ from single-append bytes");
+
+        // And it replays to the same frames.
+        let rec = open(batched.path(), 1 << 20);
+        assert_eq!(rec.frames.len(), 50);
+        assert_eq!(rec.frames[49].seq, Seq(50));
+    }
+
+    #[test]
+    fn replay_open_streams_the_same_frames_as_open_with() {
+        // Streaming recovery must yield the identical frame sequence and
+        // metadata as the materializing path — it just never builds the Vec.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut rec = open(dir.path(), 200); // small segments → several files
+            for i in 1..=100u64 {
+                rec.journal
+                    .append(&frame(i, format!("payload-{i}").as_bytes()))
+                    .unwrap();
+            }
+        }
+        // Materialized reference.
+        let reference = Journal::<RealStorage>::open(JournalConfig::new(dir.path())).unwrap();
+
+        // Streaming: collect via the callback (in real use the caller would
+        // apply each frame and never retain it).
+        let mut streamed = Vec::new();
+        let (journal, meta) = Journal::<RealStorage>::replay_open(
+            JournalConfig::new(dir.path()),
+            RealStorage,
+            |f| streamed.push(f),
+        )
+        .unwrap();
+
+        assert_eq!(streamed, reference.frames, "streamed frames differ");
+        assert_eq!(meta.first_seq, reference.first_seq);
+        assert_eq!(meta.last_seq, Seq(100));
+        assert_eq!(journal.last_seq(), Seq(100));
+    }
+
+    #[test]
+    fn append_batch_rejects_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = open(dir.path(), 1 << 20);
+        rec.journal.append(&frame(1, b"a")).unwrap();
+        // Batch starting at 3 (not 2) is out of order — nothing is written.
+        let bad = [frame(3, b"c"), frame(4, b"d")];
+        assert!(matches!(
+            rec.journal.append_batch(&bad),
+            Err(JournalError::OutOfOrderAppend { .. })
+        ));
+        assert_eq!(rec.journal.last_seq(), Seq(1), "failed batch left no trace");
     }
 
     #[test]

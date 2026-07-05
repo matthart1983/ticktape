@@ -13,7 +13,7 @@ struct Meter {
     last_bump_at: Timestamp,
 }
 
-#[derive(Encode, Decode, PartialEq, Debug)]
+#[derive(Encode, Decode, PartialEq, Debug, Clone)]
 enum Cmd {
     Bump(i64),
     Zero,
@@ -75,6 +75,51 @@ fn config(dir: &std::path::Path) -> NodeConfig {
     let mut config = NodeConfig::new(dir);
     config.journal.fsync = FsyncPolicy::EveryFrame;
     config
+}
+
+#[test]
+fn submit_batch_matches_repeated_submit() {
+    // Group commit must be observationally identical to N submits: same
+    // seqs, same outputs, same final state, and a byte-identical journal.
+    let cmds = vec![Cmd::Bump(5), Cmd::Bump(-2), Cmd::Zero, Cmd::Bump(9)];
+
+    let one = tempfile::tempdir().unwrap();
+    {
+        let mut node: Node<Meter, _> =
+            Node::open_with_clock(config(one.path()), (), ManualClock(Timestamp(100))).unwrap();
+        for c in &cmds {
+            node.submit(c.clone()).unwrap();
+        }
+        node.sync().unwrap();
+    }
+
+    let batch = tempfile::tempdir().unwrap();
+    let results;
+    {
+        let mut node: Node<Meter, _> =
+            Node::open_with_clock(config(batch.path()), (), ManualClock(Timestamp(100))).unwrap();
+        results = node.submit_batch(&cmds).unwrap();
+        node.sync().unwrap();
+        assert_eq!(node.service().total, 9);
+    }
+
+    // Same seqs + outputs from the batch call as the individual submits give.
+    assert_eq!(results[0], (Seq(1), vec![Evt::At(100), Evt::Total(5)]));
+    assert_eq!(results[3], (Seq(4), vec![Evt::At(100), Evt::Total(9)]));
+
+    // Byte-identical journals.
+    let seg = format!("{:020}.seg", 1);
+    assert_eq!(
+        std::fs::read(one.path().join(&seg)).unwrap(),
+        std::fs::read(batch.path().join(&seg)).unwrap(),
+        "group-commit journal differs from per-submit journal"
+    );
+
+    // And the batched journal recovers to the identical state.
+    let node: Node<Meter, _> =
+        Node::open_with_clock(config(batch.path()), (), ManualClock(Timestamp(0))).unwrap();
+    assert_eq!(node.seq(), Seq(4));
+    assert_eq!(node.service().total, 9);
 }
 
 #[test]

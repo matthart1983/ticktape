@@ -206,24 +206,55 @@ Benchmarked gaps (see README Performance): synced-fsync p99 budget of
 15 µs vs measured 200 µs (Linux) / ~4 ms (macOS); 2–3 M frames/s
 throughput budget vs 0.8–1.7 M/s.
 
-1. **Async group commit**: batch concurrent ingress into one
-   `pwritev` + `fdatasync` per window with deferred acks (depends on
-   P1.3). This is the single change that makes the synced budgets
-   reachable.
-2. **Packet batching** in the transport publisher (fill to
-   `MAX_PACKET_BYTES` instead of one frame per packet).
-3. **`io_uring` / `O_DIRECT`** journal path (Linux, feature-gated).
-4. **Shared-memory IPC ring** for same-box fan-out (the spec's IpcShm).
-5. **Streaming replay** — recovery iterates segments instead of
-   materializing `Vec<Frame>` (memory ∝ journal size today; P0.1
-   compaction bounds the size, this removes the materialization).
-6. **Allocation-free hot path** — jimgreco/core is obsessively
-   zero-allocation (Agrona buffers, garbage-free collections); we allocate
-   per frame (`Vec<u8>` payloads, `encode_to_vec` per message, clones per
-   fan-out sink). Rust has no GC but allocation still caps throughput:
-   introduce buffer reuse/arenas on the sequencer path and a borrowed
-   `Frame<'a>` view type decoding directly out of segment/packet buffers.
-7. Hardware CRC32C (SSE4.2 / ARMv8) behind the same function.
+**Status: 5 of 7 landed in v0.16.0; 2 (io_uring, shm ring) deferred pending
+a dependency + Linux decision — see below.**
+
+1. **✅ Group commit — DONE.** `Journal::append_batch` writes a whole
+   contiguous run with one `write_all` + one fsync, and `Node::submit_batch`
+   sequences+journals a batch that way, then applies each input in order.
+   Observationally identical to N `submit`s (a test asserts a byte-identical
+   journal), but the batch pays one `fdatasync` instead of N. Bench: on
+   macOS (APFS fsync ≈ 4 ms) a 64-input batch under `EveryFrame` costs
+   ≈ 66 µs/input vs ≈ 4 ms/input single — ~60× — which is what brings synced
+   latency under budget on real NVMe. (This is the primitive; the "deferred
+   acks / concurrent ingress" wording of the original item is realized by a
+   caller — e.g. the gateway — draining a burst into one `submit_batch`.)
+2. **✅ Packet batching — DONE.** `Publisher::publish_batch{,_to}` packs as
+   many seq-contiguous frames as fit (≤ `MAX_PACKET_BYTES`) into each packet
+   — one syscall per packet, not per frame — encoding through a reusable
+   buffer. Round-trips through the real receiver in a loopback test.
+3. **◻ `io_uring` / `O_DIRECT` journal path — DEFERRED (dependency + Linux).**
+   Needs the `io-uring`/`libc` crate and a Linux kernel; unverifiable on the
+   macOS dev box, and adds the workspace's first non-dev dependency. The seam
+   already exists: it is a `Storage` impl (the trait the fault-injecting
+   `SimStorage` also implements), so it slots in without touching the
+   journal. Awaiting a call on introducing the dependency.
+4. **◻ Shared-memory IPC ring — DEFERRED (dependency + new subsystem).** The
+   spec's IpcShm for same-box fan-out. A real cross-process ring needs
+   `mmap` (a `libc`/`memmap2` dependency) and is a sizeable new module. The
+   `PacketSource` trait is the seam — a shm ring is another source alongside
+   UDP/Unix-datagram — so it slots in behind the existing transport
+   abstraction. Awaiting the same dependency call as #3.
+5. **✅ Streaming replay — DONE.** `Journal::replay_open` streams frames to a
+   callback in seq order without materializing `Vec<Frame>` (peak memory =
+   one frame + one segment buffer). `verify_replay` uses it, so the
+   determinism check no longer builds a second full frame vector. (Live Node
+   crash-recovery still uses the materializing path — its snapshot-anchor
+   selection needs journal metadata before replay, and P0.1 compaction
+   already bounds the materialized size; rewiring it onto the streaming
+   primitive is a safe follow-up, not a budget blocker.)
+6. **✅ Allocation-free hot path (sequencer + fan-out) — DONE.** The journal
+   append path encodes through a reusable `scratch` buffer instead of a
+   fresh `Vec<u8>` per frame (`append`/`append_batch`); the publisher packs
+   through a reusable buffer (`encode_data_into`, no per-frame `Vec`). The
+   borrowed `Frame<'a>` view decoding directly out of segment/packet buffers
+   remains a further step (the read path still owns payloads), tracked but
+   not required for the write-side budgets.
+7. **✅ Hardware CRC32C — DONE.** `crc32c` dispatches to ARMv8 `crc32c*` /
+   SSE4.2 `crc32` (runtime-detected) with the software table as fallback; a
+   differential test pins hardware == software across all lengths 0..300.
+   Bench: 10.7 GB/s on Apple Silicon (vs ~1–2 GB/s for the table). Still
+   dependency-free — intrinsics from `core::arch`.
 
 ## P3 — polish, tooling, and honesty upkeep
 

@@ -48,12 +48,14 @@ fn main() {
     println!("ticktape bench — spec §14 budgets (budgets, not SLAs)\n");
 
     apply_step();
+    crc_throughput();
     submit_latency(
         "submit (fsync=never)",
         FsyncPolicy::Never,
         200_000,
         "p50 < 1 µs, p99 < 5 µs*",
     );
+    group_commit_latency();
     submit_latency(
         "submit (fsync=group-commit 50µs)",
         FsyncPolicy::Micros(50),
@@ -104,6 +106,61 @@ fn apply_step() {
         "apply step (Bank service)",
         format!("{ns} ns/op"),
         "< 200 ns",
+    );
+}
+
+/// CRC32C throughput on the dispatched path (hardware `crc32c*`/SSE4.2 where
+/// present). Every frame header + payload is checksummed on the hot path, so
+/// this is a direct multiplier on sequencer and transport throughput.
+fn crc_throughput() {
+    use ticktape_core::crc32c::crc32c;
+    let buf = vec![0x5Au8; 4096];
+    // Warmup.
+    for _ in 0..10_000 {
+        black_box(crc32c(black_box(&buf)));
+    }
+    let iters = 500_000u64;
+    let start = Instant::now();
+    for _ in 0..iters {
+        black_box(crc32c(black_box(&buf)));
+    }
+    let elapsed = start.elapsed();
+    let gbps = (iters * buf.len() as u64) as f64 / elapsed.as_secs_f64() / 1e9;
+    row(
+        "crc32c (4 KiB, hw-dispatched)",
+        format!("{gbps:.1} GB/s"),
+        "hardware where available",
+    );
+}
+
+/// Group commit: one fsync amortized across a batch of inputs
+/// ([`Node::submit_batch`]) vs a per-input fsync. Reported as per-input
+/// latency under `EveryFrame` durability — the batched path pays one
+/// `fdatasync` per batch, which is what brings synced latency down under load.
+fn group_commit_latency() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = NodeConfig::new(dir.path());
+    config.journal.fsync = FsyncPolicy::EveryFrame;
+    let mut node: Node<Bank, _> =
+        Node::open_with_clock(config, (), ManualClock(Timestamp(1))).unwrap();
+    let mut rng = Rng::new(9);
+    let batch: Vec<_> = (0..64).map(|_| gen_transfer(&mut rng)).collect();
+
+    for _ in 0..50 {
+        node.submit_batch(&batch).unwrap();
+    }
+    let batches = 2_000u64;
+    let start = Instant::now();
+    for _ in 0..batches {
+        black_box(node.submit_batch(black_box(&batch)).unwrap());
+    }
+    let wall = start.elapsed();
+    let per_input = wall.as_nanos() as u64 / (batches * batch.len() as u64);
+    let throughput = (batches * batch.len() as u64) as f64 / wall.as_secs_f64();
+    row(
+        "submit_batch (fsync=every, 64/batch)",
+        format!("{} per input · {:.2} M/s", fmt_ns(per_input), throughput / 1e6),
+        "1 fsync amortized over the batch",
     );
 }
 

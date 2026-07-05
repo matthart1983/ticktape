@@ -529,6 +529,42 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         Ok((frame.seq, released))
     }
 
+    /// **Group commit.** Sequence and journal a whole batch of inputs with a
+    /// single write + a single fsync (via [`Journal::append_batch`]), then
+    /// apply them in order. Semantically identical to calling [`Node::submit`]
+    /// once per input — same seqs, same journaled frames, same outputs — but
+    /// the durability cost of the batch is one fsync instead of N, which is
+    /// what makes the synced-fsync latency budget reachable when a caller
+    /// (e.g. the gateway draining a burst) has several inputs ready at once.
+    /// Returns one `(seq, released outputs)` per input, in order (each
+    /// entry's outputs follow the same Tier-0/1 vs Tier-2 rules as `submit`,
+    /// and include any timers that fired as a consequence of that input).
+    pub fn submit_batch(
+        &mut self,
+        inputs: &[S::Input],
+    ) -> Result<Vec<(Seq, Vec<S::Output>)>, NodeError> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Stage every frame (assigns seqs + timestamps) without journaling,
+        // then durably commit the contiguous run in one shot.
+        let now = self.clock.now();
+        let frames: Vec<Frame> = inputs
+            .iter()
+            .map(|input| self.stage_frame(FrameKind::Input, encode_to_vec(input), now))
+            .collect();
+        self.journal.append_batch(&frames)?;
+        // Now apply each in order — durability already established for all.
+        let mut results = Vec::with_capacity(inputs.len());
+        for (input, frame) in inputs.iter().zip(frames.iter()) {
+            let outputs = self.run_step(frame, |svc, ctx| svc.apply(frame.seq, input, ctx));
+            let mut released = self.finish_frame(frame, outputs)?;
+            released.extend(self.fire_due_timers()?);
+            results.push((frame.seq, released));
+        }
+        Ok(results)
+    }
+
     /// Run one live service step: build the deterministic context (capturing
     /// timer requests), run `step`, drain the outputs, and fold the timer
     /// requests into the wheel tagged with this frame's seq. Returns the
@@ -732,14 +768,24 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         payload: Vec<u8>,
         at: Timestamp,
     ) -> Result<Frame, NodeError> {
+        let frame = self.stage_frame(kind, payload, at);
+        self.journal.append(&frame)?;
+        Ok(frame)
+    }
+
+    /// Assign the next seq + (monotonic-clamped) timestamp and build the
+    /// frame, advancing the sequencer — but do *not* journal it. The caller
+    /// journals (one frame via `append`, or a batch via `append_batch`). This
+    /// split is what lets [`Node::submit_batch`] group-commit many frames
+    /// with a single write + fsync.
+    fn stage_frame(&mut self, kind: FrameKind, payload: Vec<u8>, at: Timestamp) -> Frame {
         let seq = self.seq.next();
         // Clamp to monotonic non-decreasing so time never runs backwards.
         let now = at.max(self.last_timestamp);
         let frame = Frame::new(seq, now, self.stream_id, kind, payload);
-        self.journal.append(&frame)?;
         self.seq = seq;
         self.last_timestamp = now;
-        Ok(frame)
+        frame
     }
 
     /// Subscribe to the sequenced stream (all frames from now on).
@@ -802,40 +848,44 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
     pub fn verify_replay(&mut self) -> Result<bool, NodeError> {
         // The replayer reads what's on disk, so flush lazy fsync policies.
         self.sync()?;
-        let recovered = Journal::open_with(self.journal_config.clone(), self.storage.clone())?;
         let mut replayed = S::genesis(&self.service_config);
         let mut outputs = OutBuf::new();
         let mut timer_ops: Vec<TimerReq> = Vec::new();
-        // Replay both the application inputs and the journaled timer firings:
-        // a `TimerFired` frame is an input to the service just like any other.
-        // Timer *scheduling* is ignored here (this check only compares state,
-        // which the journaled firings already determine).
-        for frame in &recovered.frames {
-            let mut apply = |step: &mut dyn FnMut(&mut S, &mut Ctx<'_, S::Output>)| {
-                timer_ops.clear();
-                let mut ctx = Ctx::new(frame.seq, frame.timestamp, &mut outputs, &mut timer_ops);
-                step(&mut replayed, &mut ctx);
-                outputs.drain();
-            };
-            match frame.kind {
-                FrameKind::Input => {
-                    let input: S::Input =
-                        decode_all(&frame.payload).map_err(|err| NodeError::CorruptInput {
-                            seq: frame.seq,
-                            err,
-                        })?;
-                    apply(&mut |svc, ctx| svc.apply(frame.seq, &input, ctx));
+        let mut decode_err: Option<NodeError> = None;
+        // Stream the journal frame-by-frame (no second full `Vec<Frame>`),
+        // replaying both application inputs and journaled timer firings — a
+        // `TimerFired` frame is an input to the service like any other. Timer
+        // *scheduling* is ignored here (this check only compares state, which
+        // the journaled firings already determine).
+        Journal::replay_open(
+            self.journal_config.clone(),
+            self.storage.clone(),
+            |frame| {
+                if decode_err.is_some() {
+                    return;
                 }
-                FrameKind::TimerFired => {
-                    let id: u64 =
-                        decode_all(&frame.payload).map_err(|err| NodeError::CorruptInput {
-                            seq: frame.seq,
-                            err,
-                        })?;
-                    apply(&mut |svc, ctx| svc.on_timer(id, ctx));
+                let mut apply = |step: &mut dyn FnMut(&mut S, &mut Ctx<'_, S::Output>)| {
+                    timer_ops.clear();
+                    let mut ctx =
+                        Ctx::new(frame.seq, frame.timestamp, &mut outputs, &mut timer_ops);
+                    step(&mut replayed, &mut ctx);
+                    outputs.drain();
+                };
+                match frame.kind {
+                    FrameKind::Input => match decode_all::<S::Input>(&frame.payload) {
+                        Ok(input) => apply(&mut |svc, ctx| svc.apply(frame.seq, &input, ctx)),
+                        Err(err) => decode_err = Some(NodeError::CorruptInput { seq: frame.seq, err }),
+                    },
+                    FrameKind::TimerFired => match decode_all::<u64>(&frame.payload) {
+                        Ok(id) => apply(&mut |svc, ctx| svc.on_timer(id, ctx)),
+                        Err(err) => decode_err = Some(NodeError::CorruptInput { seq: frame.seq, err }),
+                    },
+                    _ => {}
                 }
-                _ => {}
-            }
+            },
+        )?;
+        if let Some(e) = decode_err {
+            return Err(e);
         }
         let live = encode_to_vec(&self.service.snapshot());
         let fresh = encode_to_vec(&replayed.snapshot());
