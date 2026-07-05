@@ -408,6 +408,7 @@ where
     // is covered by the runtime's real-timestamp recovery tests.)
     let mut fresh = S::genesis(service_config);
     let mut outputs = OutBuf::new();
+    let mut timer_ops = Vec::new();
     for (i, exp) in expected.iter().enumerate() {
         if let Expected::Input(bytes) = exp {
             let seq = Seq(i as u64 + 1);
@@ -416,7 +417,7 @@ where
                     "shadow input no longer decodes at seq {seq}: {e}"
                 )))
             })?;
-            let mut ctx = Ctx::new(seq, Timestamp::ZERO, &mut outputs);
+            let mut ctx = Ctx::new(seq, Timestamp::ZERO, &mut outputs, &mut timer_ops);
             fresh.apply(seq, &input, &mut ctx);
             outputs.drain();
         }

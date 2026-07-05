@@ -17,7 +17,7 @@
 //! order, so it is byte-identical on every replica at the same seq.
 
 use std::collections::{BTreeMap, VecDeque};
-use ticktape::{Ctx, Decode, Encode, Seq, Service};
+use ticktape::{Ctx, Decode, Encode, Seq, Service, Timestamp};
 use ticktape_sim::{InvariantViolation, Invariants};
 
 pub type Price = u32;
@@ -37,6 +37,18 @@ pub enum Cmd {
         side: Side,
         price: Price,
         qty: Qty,
+    },
+    /// A **good-till-date** order: like `Submit`, but any unfilled remainder
+    /// that rests is automatically cancelled when sequenced time reaches
+    /// `expire_at` (nanos). Expiry is a deterministic timer — it fires as a
+    /// journaled `TimerFired` frame, so it happens at the identical seq on
+    /// every replica and every replay.
+    SubmitGtd {
+        id: OrderId,
+        side: Side,
+        price: Price,
+        qty: Qty,
+        expire_at: u64,
     },
     Cancel {
         id: OrderId,
@@ -63,6 +75,12 @@ pub enum Evt {
         qty: Qty,
     },
     Canceled {
+        id: OrderId,
+        remaining: Qty,
+    },
+    /// A good-till-date order's resting remainder reached its deadline and
+    /// was removed by the timer.
+    Expired {
         id: OrderId,
         remaining: Qty,
     },
@@ -125,9 +143,43 @@ impl Service for OrderBook {
                 side,
                 price,
                 qty,
-            } => self.submit(id, side, price, qty, ctx),
+            } => self.submit(id, side, price, qty, None, ctx),
+            Cmd::SubmitGtd {
+                id,
+                side,
+                price,
+                qty,
+                expire_at,
+            } => self.submit(id, side, price, qty, Some(Timestamp(expire_at)), ctx),
             Cmd::Cancel { id } => self.cancel(id, ctx),
         }
+    }
+
+    /// A good-till-date order's expiry timer fired. `id` doubles as the timer
+    /// id. If the order is still resting, remove it and emit `Expired`; if it
+    /// was already filled or cancelled (its timer was cancelled then, but a
+    /// firing already in flight is harmless), do nothing. Deterministic: the
+    /// firing is a journaled frame, so this runs identically everywhere.
+    fn on_timer(&mut self, id: u64, ctx: &mut Ctx<'_, Evt>) {
+        let Some((side, price)) = self.index.remove(&id) else {
+            return; // no longer resting — nothing to expire
+        };
+        let level = self.side_mut(side).get_mut(&price).expect("indexed level");
+        let pos = level
+            .iter()
+            .position(|o| o.id == id)
+            .expect("indexed order in level");
+        let order = level.remove(pos).expect("position valid");
+        if level.is_empty() {
+            self.side_mut(side).remove(&price);
+        }
+        // Expired shares leave `resting` and enter `canceled` — conservation
+        // (accepted = 2*traded + canceled + resting) is preserved.
+        self.canceled_shares += order.qty as u64;
+        ctx.emit(Evt::Expired {
+            id,
+            remaining: order.qty,
+        });
     }
 
     fn snapshot(&self) -> BookSnapshot {
@@ -176,7 +228,15 @@ impl OrderBook {
         }
     }
 
-    fn submit(&mut self, id: OrderId, side: Side, price: Price, qty: Qty, ctx: &mut Ctx<'_, Evt>) {
+    fn submit(
+        &mut self,
+        id: OrderId,
+        side: Side,
+        price: Price,
+        qty: Qty,
+        expire_at: Option<Timestamp>,
+        ctx: &mut Ctx<'_, Evt>,
+    ) {
         if qty == 0 {
             ctx.emit(Evt::Rejected {
                 id,
@@ -204,6 +264,11 @@ impl OrderBook {
                 .entry(price)
                 .or_default()
                 .push_back(Resting { id, qty: remaining });
+            // A GTD remainder that rests arms its expiry timer (keyed by the
+            // order id). A fully-filled GTD order never rests, so never arms.
+            if let Some(at) = expire_at {
+                ctx.set_timer(id, at);
+            }
         }
     }
 
@@ -289,6 +354,10 @@ impl OrderBook {
         self.traded_shares += traded_here;
         for id in &filled_ids {
             self.index.remove(id);
+            // A fully-filled maker leaves the book; cancel any GTD expiry it
+            // had armed (harmless no-op for a plain order). Keeps the timer
+            // wheel bounded to only still-resting orders.
+            ctx.cancel_timer(*id);
         }
         let level_empty = self
             .side_mut(maker_side)
@@ -318,6 +387,8 @@ impl OrderBook {
             self.side_mut(side).remove(&price);
         }
         self.canceled_shares += order.qty as u64;
+        // Cancel any GTD expiry timer (no-op for a plain order).
+        ctx.cancel_timer(id);
         ctx.emit(Evt::Canceled {
             id,
             remaining: order.qty,

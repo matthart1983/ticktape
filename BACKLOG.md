@@ -164,21 +164,32 @@ Stage-A ack back-channel), which is what finally makes the gateway's
 (P2.1). The runtime mechanism those depend on now exists and is proven;
 only the transport plumbing remains.
 
-### 4. Deterministic timers (capability gap — from the core/Coral review)
-Services can read sequenced time but cannot schedule against it: there is
-no way to express "cancel this order in 30s", GTD expiry, auction phases,
-or deterministic timeouts — bread-and-butter exchange logic. jimgreco/core
-treats timers as first-class: the sequencer owns a scheduler and timer
-firings are *sequenced messages*, identical on every replica and replay.
-**Design:** `ctx.set_timer(id, at)` / `ctx.cancel_timer(id)` emit timer
-requests; the sequencer tracks pending deadlines (ordered by
-`(at, seq, id)` for total determinism) and injects `TimerFired { id }` as
-a sequenced input when sequenced time passes each deadline. Pending-timer
-state is part of the snapshot; the simulator fuzzes firing under crashes
-for free.
-**Done means:** the order book example supports good-till-date orders that
-expire identically on live, replay, and replica paths, verified under the
-simulator; timer state survives snapshot-based recovery.
+### ✅ 4. Deterministic timers — DONE (v0.14.0)
+The capability gap from the core/Coral review is closed: services can now
+schedule against sequenced time. `Ctx::set_timer(id, at)` /
+`cancel_timer(id)` record requests during a step; the runtime holds them in
+a `TimerWheel` ordered by `(deadline, set-at-seq, id)` for total
+determinism, and when sequenced time (advanced by any `submit` or `tick`)
+reaches a deadline the sequencer injects a `TimerFired` frame carrying the
+`id`, delivered to a new `Service::on_timer(id, ctx)` handler (default
+no-op). Firing is a *journaled, sequenced* frame — stamped at the trigger
+time so a burst of same-time timers can't advance time or loop forever —
+so it replays identically on recovery and on every replica (`Replica` now
+applies `TimerFired` frames too). Pending-timer state is serialized into
+the snapshot alongside the service state (`(Snapshot, wheel)` tuple), so
+timers armed before a snapshot still fire after a snapshot-based recovery.
+`Node::pending_timer_count()` gauges the wheel (a disk-pressure signal).
+**Verified:** 3 `TimerWheel` unit tests (ordering, re-arm/cancel, snapshot
+round-trip); 7 runtime end-to-end tests (fire-on-time, tick-fires,
+cancel-prevents, replay equivalence via `verify_replay`, snapshot survival,
+handler-re-arm, trigger-time stamping); and the flagship: the **order book
+gained good-till-date orders** (`Cmd::SubmitGtd { …, expire_at }` →
+`Evt::Expired`), proven under the fault-injecting `SimStorage` to expire
+identically on all three paths — **live**, **replay** (crash recovery
+re-runs the journaled firings), and **replica** (an independent follower of
+the stream) — with GTD timer state surviving snapshot-based recovery and
+disarming correctly on fill/cancel. Share-conservation invariant holds
+across expiry (expired shares count as canceled).
 
 ## P2 — the named performance workstream (budgets currently missed)
 

@@ -144,7 +144,8 @@ replay equivalence: OK
 The flagship example is a **price-time-priority limit order book** —
 journaled, snapshotted, and fuzzed under fault injection with
 exchange-grade invariants (never a crossed book; every accepted share is
-exactly one of traded, canceled, or resting):
+exactly one of traded, canceled, or resting), including good-till-date
+orders that expire on a deterministic timer:
 
 ```text
 $ cargo run -p orderbook -- sell 100 102
@@ -270,10 +271,17 @@ CI runs 2000 fresh seeds on every push.
 ## How determinism is enforced (not hoped for)
 
 - **`Ctx` is the only door.** Inside `apply` you can read `ctx.now()`
-  (sequenced time), `ctx.seq()`, and call `ctx.emit(...)`. There is
-  deliberately no spawn, no sleep, no randomness, no file, no socket.
-  External interactions use the split-phase pattern: emit a request event;
-  the response re-enters later as a sequenced input.
+  (sequenced time), `ctx.seq()`, call `ctx.emit(...)`, and schedule
+  deterministic timers with `ctx.set_timer(id, at)` / `ctx.cancel_timer(id)`.
+  There is deliberately no spawn, no sleep, no randomness, no file, no
+  socket. External interactions use the split-phase pattern: emit a request
+  event; the response re-enters later as a sequenced input.
+- **Timers are sequenced, not wall-clock.** When sequenced time reaches a
+  timer's deadline the sequencer injects a journaled `TimerFired` frame into
+  `Service::on_timer` — so "cancel this order in 30s", GTD expiry, and
+  auction phases fire at the identical seq on every replica and every replay,
+  and pending-timer state rides along in the snapshot. The order book
+  example uses this for good-till-date orders.
 - **The codec rejects nondeterminism at compile time.** `HashMap`/`HashSet`
   (iteration order) and bare floats (NaN, `-0.0`) have no `Encode`/`Decode`
   impls, so they cannot appear in inputs or snapshots. Use `BTreeMap` and
@@ -344,7 +352,7 @@ own machinery plus a 200-seed crash run showing no committed output is lost
 across power loss. What remains is audited in
 [BACKLOG.md](BACKLOG.md): wiring the Tier-2 deferred-ack mode to a
 live follower ack channel in the packaged server, offline-session
-event replay, deterministic timers, and the async group-commit/`io_uring`
+event replay, and the async group-commit/`io_uring`
 performance workstream.
 Operators get a Prometheus `/metrics` endpoint per server (role, replication
 lag, snapshot seq, disk) to watch a deployment and drive failover. The API

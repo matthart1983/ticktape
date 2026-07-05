@@ -29,9 +29,17 @@ use std::fmt;
 use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use ticktape_core::{
-    decode_all, encode_to_vec, Ctx, Frame, FrameKind, OutBuf, Seq, Service, Timestamp,
+    decode_all, encode_to_vec, Ctx, Frame, FrameKind, OutBuf, Seq, Service, Timestamp, TimerReq,
 };
 use ticktape_journal::{Journal, JournalConfig, JournalError, RealStorage, SnapshotStore, Storage};
+
+mod timer;
+use timer::TimerWheel;
+
+/// The on-disk snapshot payload: the service's own snapshot plus the pending
+/// timer wheel (`(id, deadline_nanos, set_at_seq)` triples), so timers armed
+/// before the snapshot still fire after a snapshot-based recovery.
+type SnapshotPayload<S> = (<S as Service>::Snapshot, Vec<(u64, u64, u64)>);
 
 pub use ticktape_journal::FsyncPolicy;
 
@@ -250,6 +258,29 @@ pub struct RecoveryInfo {
     pub inputs_replayed: u64,
 }
 
+/// Run one service step during *recovery replay* (free function — the `Node`
+/// does not exist yet): apply the step, discard its outputs (they already had
+/// their effect or were lost with the crashed process), and fold its timer
+/// requests into the wheel being rebuilt, tagged with the frame's seq.
+fn replay_step<S: Service>(
+    service: &mut S,
+    outputs: &mut OutBuf<S::Output>,
+    timer_ops: &mut Vec<TimerReq>,
+    wheel: &mut TimerWheel,
+    frame: &Frame,
+    step: impl FnOnce(&mut S, &mut Ctx<'_, S::Output>),
+) {
+    timer_ops.clear();
+    {
+        let mut ctx = Ctx::new(frame.seq, frame.timestamp, outputs, timer_ops);
+        step(service, &mut ctx);
+    }
+    outputs.drain();
+    for op in timer_ops.drain(..) {
+        wheel.apply(op, frame.seq);
+    }
+}
+
 /// The in-process sequenced-stream fan-out: every subscriber receives every
 /// sequenced frame, in seq order. The M0 stand-in for the transport layer
 /// (IPC and reliable multicast are M3); useful for drop-copy/audit-style
@@ -297,6 +328,11 @@ pub struct Node<S: Service, T: TimeSource = WallClock, St: Storage + Clone = Rea
     recovery: RecoveryInfo,
     /// Tier-2 quorum-commit state; `None` on a Tier 0/1 node.
     commit: Option<CommitState<S::Output>>,
+    /// Pending deterministic timers, fired as sequenced `TimerFired` frames.
+    timers: TimerWheel,
+    /// Scratch buffer for timer requests recorded during one step (reused to
+    /// avoid per-step allocation).
+    timer_ops: Vec<TimerReq>,
 }
 
 impl<S: Service> Node<S, WallClock> {
@@ -344,12 +380,14 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         let scan_ceiling = Seq(journal_last.0.max(snapshots.high_water_seq()?.0));
         let mut from_seq = Seq::GENESIS;
         let mut service = None;
+        let mut wheel = TimerWheel::new();
         for snap in snapshots.load_candidates(scan_ceiling)? {
             if snap.seq.0 + 1 < journal_first.0 {
                 continue; // older than the journal floor — leaves a gap
             }
-            if let Ok(decoded) = decode_all::<S::Snapshot>(&snap.payload) {
-                service = Some(S::restore(decoded, &service_config));
+            if let Ok((svc_snap, wheel_snap)) = decode_all::<SnapshotPayload<S>>(&snap.payload) {
+                service = Some(S::restore(svc_snap, &service_config));
+                wheel = TimerWheel::restore(wheel_snap);
                 from_seq = snap.seq;
                 break;
             }
@@ -379,6 +417,7 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         }
 
         let mut outputs = OutBuf::new();
+        let mut timer_ops: Vec<TimerReq> = Vec::new();
         let mut last_timestamp = Timestamp::ZERO;
         let mut inputs_replayed = 0u64;
 
@@ -387,18 +426,47 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
             if frame.seq <= from_seq {
                 continue; // captured by the snapshot
             }
-            if frame.kind == FrameKind::Input {
-                let input: S::Input =
-                    decode_all(&frame.payload).map_err(|err| NodeError::CorruptInput {
-                        seq: frame.seq,
-                        err,
-                    })?;
-                let mut ctx = Ctx::new(frame.seq, frame.timestamp, &mut outputs);
-                service.apply(frame.seq, &input, &mut ctx);
-                // Replayed outputs already had their effect (or were lost
-                // with the process); recovery discards them.
-                outputs.drain();
-                inputs_replayed += 1;
+            // Rebuild the timer wheel from the same set/cancel calls the live
+            // node made, so post-recovery firing is correct — but do NOT
+            // re-fire here: every firing already exists in the journal as its
+            // own `TimerFired` frame, replayed below.
+            match frame.kind {
+                FrameKind::Input => {
+                    let input: S::Input =
+                        decode_all(&frame.payload).map_err(|err| NodeError::CorruptInput {
+                            seq: frame.seq,
+                            err,
+                        })?;
+                    replay_step(
+                        &mut service,
+                        &mut outputs,
+                        &mut timer_ops,
+                        &mut wheel,
+                        frame,
+                        |svc, ctx| svc.apply(frame.seq, &input, ctx),
+                    );
+                    inputs_replayed += 1;
+                }
+                FrameKind::TimerFired => {
+                    let id: u64 =
+                        decode_all(&frame.payload).map_err(|err| NodeError::CorruptInput {
+                            seq: frame.seq,
+                            err,
+                        })?;
+                    // Mirror live firing: the timer left the wheel *before*
+                    // `on_timer` ran (so a re-arm of the same id inside the
+                    // handler survives).
+                    wheel.cancel(id);
+                    replay_step(
+                        &mut service,
+                        &mut outputs,
+                        &mut timer_ops,
+                        &mut wheel,
+                        frame,
+                        |svc, ctx| svc.on_timer(id, ctx),
+                    );
+                }
+                _ => {}
             }
         }
 
@@ -427,6 +495,8 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
                 inputs_replayed,
             },
             commit,
+            timers: wheel,
+            timer_ops: Vec::new(),
         })
     }
 
@@ -446,27 +516,87 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
     /// only one voter), later released by [`Node::record_ack`] as followers
     /// report progress. With a single voter the input commits immediately
     /// and its outputs come back here.
+    /// The returned vector also includes any outputs produced by timers that
+    /// fired as a consequence of the sequenced time this input carries (in
+    /// seq order, after the input's own outputs). Under quorum commit the
+    /// same withholding applies to each — every frame, input or fired, is
+    /// released only when a majority holds it.
     pub fn submit(&mut self, input: S::Input) -> Result<(Seq, Vec<S::Output>), NodeError> {
         let frame = self.sequence(FrameKind::Input, encode_to_vec(&input))?;
-        let mut ctx = Ctx::new(frame.seq, frame.timestamp, &mut self.outputs);
-        self.service.apply(frame.seq, &input, &mut ctx);
+        let outputs = self.run_step(&frame, |svc, ctx| svc.apply(frame.seq, &input, ctx));
+        let mut released = self.finish_frame(&frame, outputs)?;
+        released.extend(self.fire_due_timers()?);
+        Ok((frame.seq, released))
+    }
+
+    /// Run one live service step: build the deterministic context (capturing
+    /// timer requests), run `step`, drain the outputs, and fold the timer
+    /// requests into the wheel tagged with this frame's seq. Returns the
+    /// emitted outputs.
+    fn run_step(
+        &mut self,
+        frame: &Frame,
+        step: impl FnOnce(&mut S, &mut Ctx<'_, S::Output>),
+    ) -> Vec<S::Output> {
+        self.timer_ops.clear();
+        {
+            let mut ctx = Ctx::new(
+                frame.seq,
+                frame.timestamp,
+                &mut self.outputs,
+                &mut self.timer_ops,
+            );
+            step(&mut self.service, &mut ctx);
+        }
         let outputs = self.outputs.drain();
-        self.bus.publish(&frame);
+        for op in self.timer_ops.drain(..) {
+            self.timers.apply(op, frame.seq);
+        }
+        outputs
+    }
+
+    /// Publish a just-applied data frame (input or fired timer), snapshot on
+    /// cadence, and route its outputs through the commit path: released
+    /// immediately at Tier 0/1, or withheld until quorum at Tier 2 (in which
+    /// case the returned outputs are whatever crossed the watermark now).
+    fn finish_frame(
+        &mut self,
+        frame: &Frame,
+        outputs: Vec<S::Output>,
+    ) -> Result<Vec<S::Output>, NodeError> {
+        self.bus.publish(frame);
         self.maybe_snapshot(frame.seq)?;
-        match &mut self.commit {
-            None => Ok((frame.seq, outputs)),
+        let released = match &mut self.commit {
+            None => outputs,
             Some(state) => {
                 state.pending.insert(frame.seq, outputs);
                 let me = state.self_replica;
                 state.record(me, frame.seq);
-                let released = state
+                state
                     .drain_committed()
                     .into_iter()
                     .flat_map(|(_, outs)| outs)
-                    .collect();
-                Ok((frame.seq, released))
+                    .collect()
             }
+        };
+        Ok(released)
+    }
+
+    /// Fire every timer now due at the current sequenced time, in
+    /// `(deadline, set-at, id)` order. Each firing is sequenced as its own
+    /// journaled `TimerFired` frame (stamped at the trigger time, so firing
+    /// does not advance time and the loop terminates), applied via
+    /// [`Service::on_timer`], which may itself arm or cancel timers. Returns
+    /// the released outputs of all firings.
+    fn fire_due_timers(&mut self) -> Result<Vec<S::Output>, NodeError> {
+        let mut released = Vec::new();
+        while let Some(id) = self.timers.pop_due(self.last_timestamp) {
+            let frame =
+                self.sequence_at(FrameKind::TimerFired, encode_to_vec(&id), self.last_timestamp)?;
+            let outputs = self.run_step(&frame, |svc, ctx| svc.on_timer(id, ctx));
+            released.extend(self.finish_frame(&frame, outputs)?);
         }
+        Ok(released)
     }
 
     /// Record that follower `replica` has durably journaled everything up to
@@ -504,14 +634,25 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         self.commit.as_ref().map_or(0, |s| s.pending.len())
     }
 
+    /// Number of timers currently armed. Part of the snapshot, so it is also
+    /// a disk-pressure gauge — an application that arms unbounded timers
+    /// without firing or cancelling them grows its snapshot without bound.
+    pub fn pending_timer_count(&self) -> usize {
+        self.timers.len()
+    }
+
     /// Inject a sequenced `Tick`, advancing deterministic time for all
-    /// consumers (and all future replays) without an application input.
+    /// consumers (and all future replays) without an application input. Any
+    /// timers whose deadline the new time reaches fire here (their outputs
+    /// are published on the stream; use [`Node::submit`] if you need them
+    /// returned).
     pub fn tick(&mut self) -> Result<Seq, NodeError> {
         let frame = self.sequence(FrameKind::Tick, Vec::new())?;
         let seq = frame.seq;
         self.bus.publish(&frame);
         self.maybe_snapshot(seq)?;
         self.note_self_progress(seq);
+        self.fire_due_timers()?;
         Ok(seq)
     }
 
@@ -554,7 +695,11 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         if seq.0 % every.max(1) != 0 {
             return Ok(());
         }
-        let payload = encode_to_vec(&self.service.snapshot());
+        // Capture the service state *and* the pending timer wheel, so timers
+        // armed before this snapshot still fire after a snapshot-based
+        // recovery.
+        let payload: Vec<u8> =
+            encode_to_vec(&(self.service.snapshot(), self.timers.snapshot()));
         self.snapshots.write(seq, 0, &payload)?;
         let mark = self.sequence(FrameKind::SnapshotMark, encode_to_vec(&seq))?;
         self.bus.publish(&mark);
@@ -573,10 +718,23 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
     }
 
     fn sequence(&mut self, kind: FrameKind, payload: Vec<u8>) -> Result<Frame, NodeError> {
+        let at = self.clock.now();
+        self.sequence_at(kind, payload, at)
+    }
+
+    /// Sequence a frame stamped at a specific `at` (clamped monotonic).
+    /// Fired timers use this to stamp their `TimerFired` frame at the trigger
+    /// time rather than a fresh clock read — so a burst of same-time firings
+    /// does not advance sequenced time, and the firing loop terminates.
+    fn sequence_at(
+        &mut self,
+        kind: FrameKind,
+        payload: Vec<u8>,
+        at: Timestamp,
+    ) -> Result<Frame, NodeError> {
         let seq = self.seq.next();
-        // Clamp to monotonic non-decreasing so a stepping wall clock can
-        // never make sequenced time run backwards.
-        let now = self.clock.now().max(self.last_timestamp);
+        // Clamp to monotonic non-decreasing so time never runs backwards.
+        let now = at.max(self.last_timestamp);
         let frame = Frame::new(seq, now, self.stream_id, kind, payload);
         self.journal.append(&frame)?;
         self.seq = seq;
@@ -587,6 +745,15 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
     /// Subscribe to the sequenced stream (all frames from now on).
     pub fn subscribe(&mut self) -> mpsc::Receiver<Frame> {
         self.bus.subscribe()
+    }
+
+    /// Mutable access to the sequencer's time source — for a
+    /// [`ManualClock`]-driven deployment or test that advances time
+    /// explicitly (e.g. `node.clock_mut().0 = Timestamp(t)` then `tick()` to
+    /// let due timers fire). Sequenced time is still clamped monotonic, so
+    /// this can never make time run backwards on the stream.
+    pub fn clock_mut(&mut self) -> &mut T {
+        &mut self.clock
     }
 
     /// Read-only access to current state. State is a derived projection of
@@ -638,16 +805,36 @@ impl<S: Service, T: TimeSource, St: Storage + Clone> Node<S, T, St> {
         let recovered = Journal::open_with(self.journal_config.clone(), self.storage.clone())?;
         let mut replayed = S::genesis(&self.service_config);
         let mut outputs = OutBuf::new();
+        let mut timer_ops: Vec<TimerReq> = Vec::new();
+        // Replay both the application inputs and the journaled timer firings:
+        // a `TimerFired` frame is an input to the service just like any other.
+        // Timer *scheduling* is ignored here (this check only compares state,
+        // which the journaled firings already determine).
         for frame in &recovered.frames {
-            if frame.kind == FrameKind::Input {
-                let input: S::Input =
-                    decode_all(&frame.payload).map_err(|err| NodeError::CorruptInput {
-                        seq: frame.seq,
-                        err,
-                    })?;
-                let mut ctx = Ctx::new(frame.seq, frame.timestamp, &mut outputs);
-                replayed.apply(frame.seq, &input, &mut ctx);
+            let mut apply = |step: &mut dyn FnMut(&mut S, &mut Ctx<'_, S::Output>)| {
+                timer_ops.clear();
+                let mut ctx = Ctx::new(frame.seq, frame.timestamp, &mut outputs, &mut timer_ops);
+                step(&mut replayed, &mut ctx);
                 outputs.drain();
+            };
+            match frame.kind {
+                FrameKind::Input => {
+                    let input: S::Input =
+                        decode_all(&frame.payload).map_err(|err| NodeError::CorruptInput {
+                            seq: frame.seq,
+                            err,
+                        })?;
+                    apply(&mut |svc, ctx| svc.apply(frame.seq, &input, ctx));
+                }
+                FrameKind::TimerFired => {
+                    let id: u64 =
+                        decode_all(&frame.payload).map_err(|err| NodeError::CorruptInput {
+                            seq: frame.seq,
+                            err,
+                        })?;
+                    apply(&mut |svc, ctx| svc.on_timer(id, ctx));
+                }
+                _ => {}
             }
         }
         let live = encode_to_vec(&self.service.snapshot());

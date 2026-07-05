@@ -3,7 +3,7 @@
 //! recompute identical state; a promoted standby *is* the service.
 
 use std::fmt;
-use ticktape_core::{decode_all, Ctx, Frame, FrameKind, OutBuf, Seq, Service};
+use ticktape_core::{decode_all, Ctx, Frame, FrameKind, OutBuf, Seq, Service, TimerReq};
 
 #[derive(Debug)]
 pub enum ReplicaError {
@@ -38,6 +38,10 @@ pub struct Replica<S: Service> {
     service: S,
     seq: Seq,
     outputs: OutBuf<S::Output>,
+    /// Discarded scratch for timer requests: a follower mirrors the leader's
+    /// journaled `TimerFired` frames rather than running its own scheduler,
+    /// so scheduling requests made during replay have no effect here.
+    timer_ops: Vec<TimerReq>,
 }
 
 impl<S: Service> Replica<S> {
@@ -46,6 +50,7 @@ impl<S: Service> Replica<S> {
             service: S::genesis(config),
             seq: Seq::GENESIS,
             outputs: OutBuf::new(),
+            timer_ops: Vec::new(),
         }
     }
 
@@ -56,12 +61,14 @@ impl<S: Service> Replica<S> {
             service: S::restore(snapshot, config),
             seq,
             outputs: OutBuf::new(),
+            timer_ops: Vec::new(),
         }
     }
 
-    /// Apply one in-order frame. Input frames step the state machine and
-    /// return its outputs; control frames (ticks, marks, heartbeats) just
-    /// advance the seq.
+    /// Apply one in-order frame. Input frames step the state machine; a
+    /// `TimerFired` frame delivers the leader's deterministic timer firing to
+    /// `on_timer` (identical state on every replica); other control frames
+    /// (ticks, marks, heartbeats) just advance the seq. Returns any outputs.
     pub fn apply(&mut self, frame: &Frame) -> Result<Vec<S::Output>, ReplicaError> {
         let expected = self.seq.next();
         if frame.seq != expected {
@@ -71,17 +78,40 @@ impl<S: Service> Replica<S> {
             });
         }
         self.seq = frame.seq;
-        if frame.kind != FrameKind::Input {
-            return Ok(Vec::new());
+        self.timer_ops.clear();
+        match frame.kind {
+            FrameKind::Input => {
+                let input: S::Input =
+                    decode_all(&frame.payload).map_err(|err| ReplicaError::CorruptInput {
+                        seq: frame.seq,
+                        err,
+                    })?;
+                let mut ctx = Ctx::new(
+                    frame.seq,
+                    frame.timestamp,
+                    &mut self.outputs,
+                    &mut self.timer_ops,
+                );
+                self.service.apply(frame.seq, &input, &mut ctx);
+                Ok(self.outputs.drain())
+            }
+            FrameKind::TimerFired => {
+                let id: u64 =
+                    decode_all(&frame.payload).map_err(|err| ReplicaError::CorruptInput {
+                        seq: frame.seq,
+                        err,
+                    })?;
+                let mut ctx = Ctx::new(
+                    frame.seq,
+                    frame.timestamp,
+                    &mut self.outputs,
+                    &mut self.timer_ops,
+                );
+                self.service.on_timer(id, &mut ctx);
+                Ok(self.outputs.drain())
+            }
+            _ => Ok(Vec::new()),
         }
-        let input: S::Input =
-            decode_all(&frame.payload).map_err(|err| ReplicaError::CorruptInput {
-                seq: frame.seq,
-                err,
-            })?;
-        let mut ctx = Ctx::new(frame.seq, frame.timestamp, &mut self.outputs);
-        self.service.apply(frame.seq, &input, &mut ctx);
-        Ok(self.outputs.drain())
     }
 
     /// The seq of the last applied frame.

@@ -46,7 +46,7 @@
 
 pub use ticktape_core::{
     decode_all, encode_to_vec, CodecError, Ctx, Frame, FrameError, FrameKind, OutBuf, Seq, Service,
-    Timestamp,
+    Timestamp, TimerReq,
 };
 // Trait + derive macro under one name each (serde-style).
 pub use ticktape_cluster::{Acceptor, CommitTracker, Election, ElectionOutcome, EpochChange, Tier};

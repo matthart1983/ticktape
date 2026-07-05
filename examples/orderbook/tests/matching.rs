@@ -8,7 +8,8 @@ use ticktape_sim::Invariants;
 fn apply(book: &mut OrderBook, seq: &mut u64, cmd: Cmd) -> Vec<Evt> {
     *seq += 1;
     let mut out = OutBuf::new();
-    let mut ctx = Ctx::new(Seq(*seq), Timestamp(*seq * 1_000), &mut out);
+    let mut timer_ops = Vec::new();
+    let mut ctx = Ctx::new(Seq(*seq), Timestamp(*seq * 1_000), &mut out, &mut timer_ops);
     book.apply(Seq(*seq), &cmd, &mut ctx);
     book.check().expect("invariants after every apply");
     out.drain()

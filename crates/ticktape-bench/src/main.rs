@@ -83,10 +83,11 @@ fn apply_step() {
     let mut rng = Rng::new(7);
     let cmds: Vec<_> = (0..1024).map(|_| gen_transfer(&mut rng)).collect();
     let mut out = OutBuf::new();
+    let mut timer_ops = Vec::new();
 
     // Warmup.
     for i in 0..100_000u64 {
-        let mut ctx = Ctx::new(Seq(i + 1), Timestamp(i), &mut out);
+        let mut ctx = Ctx::new(Seq(i + 1), Timestamp(i), &mut out, &mut timer_ops);
         bank.apply(Seq(i + 1), &cmds[(i % 1024) as usize], &mut ctx);
         out.drain();
     }
@@ -94,7 +95,7 @@ fn apply_step() {
     let iters = 2_000_000u64;
     let start = Instant::now();
     for i in 0..iters {
-        let mut ctx = Ctx::new(Seq(i + 1), Timestamp(i), &mut out);
+        let mut ctx = Ctx::new(Seq(i + 1), Timestamp(i), &mut out, &mut timer_ops);
         bank.apply(Seq(i + 1), black_box(&cmds[(i % 1024) as usize]), &mut ctx);
         black_box(out.drain());
     }

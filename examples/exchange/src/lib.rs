@@ -144,7 +144,8 @@ impl Exchange {
     /// Drive the inner book and reconcile ownership afterwards.
     fn run_book(&mut self, seq: Seq, cmd: &Cmd, now: ticktape::Timestamp) -> Vec<Evt> {
         let mut out = OutBuf::new();
-        let mut ctx = Ctx::new(seq, now, &mut out);
+        let mut timer_ops = Vec::new();
+        let mut ctx = Ctx::new(seq, now, &mut out, &mut timer_ops);
         self.book.apply(seq, cmd, &mut ctx);
         out.drain()
     }
@@ -185,7 +186,9 @@ impl Exchange {
                     _ => {}
                 }
             }
-            Evt::Canceled { id, .. } => {
+            // A cancel and a GTD expiry both remove the order from the book;
+            // clean up ownership and notify the owner identically.
+            Evt::Canceled { id, .. } | Evt::Expired { id, .. } => {
                 if let Some(owner) = self.owners.remove(&id) {
                     if let Some(set) = self.owned.get_mut(&owner) {
                         set.remove(&id);

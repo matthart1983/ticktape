@@ -40,6 +40,11 @@ pub enum FrameKind {
     Output = 0x0002,
     /// Injected time event; payload empty, `timestamp` authoritative.
     Tick = 0x0010,
+    /// A deterministic timer reached its deadline. Payload = encoded timer
+    /// `id` (u64); the sequencer injects this as a sequenced input when
+    /// sequenced time passes the timer's `at`, so firing is journaled and
+    /// replays identically on every replica.
+    TimerFired = 0x0013,
     /// Gateway session lifecycle.
     SessionOpen = 0x0011,
     SessionClose = 0x0012,
@@ -57,6 +62,7 @@ impl FrameKind {
             0x0001 => FrameKind::Input,
             0x0002 => FrameKind::Output,
             0x0010 => FrameKind::Tick,
+            0x0013 => FrameKind::TimerFired,
             0x0011 => FrameKind::SessionOpen,
             0x0012 => FrameKind::SessionClose,
             0x0020 => FrameKind::SnapshotMark,

@@ -29,4 +29,4 @@ pub mod service;
 pub use codec::{decode_all, encode_to_vec, CodecError, Decode, Encode};
 pub use frame::{Frame, FrameError, FrameKind, FRAME_HEADER_LEN};
 pub use seq::{Seq, Timestamp};
-pub use service::{Ctx, OutBuf, Service};
+pub use service::{Ctx, OutBuf, Service, TimerReq};
