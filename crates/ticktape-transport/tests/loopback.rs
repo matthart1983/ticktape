@@ -228,12 +228,24 @@ fn follower_replica_reaches_bit_identical_state() {
         },
     );
     let mut replica: Replica<Bank> = Replica::new(&());
+    let mut idle = 0;
     while replica.seq() < node.seq() {
-        match receiver.poll(Duration::from_secs(5)).unwrap() {
+        match receiver.poll(Duration::from_millis(200)).unwrap() {
             Some(frame) => {
                 replica.apply(&frame).unwrap();
+                idle = 0;
             }
-            None => panic!("follower stalled at seq {}", replica.seq()),
+            None => {
+                // A real leader heartbeats periodically; re-announce the
+                // high-water so the receiver notices — and TCP-gap-fills —
+                // any trailing datagrams the kernel dropped under the send
+                // burst (this test publishes everything before the receiver
+                // starts draining, so a small UDP receive buffer can lose the
+                // tail on some platforms). The retransmitter holds every frame.
+                idle += 1;
+                assert!(idle < 50, "follower stalled at seq {}", replica.seq());
+                publisher.heartbeat().unwrap();
+            }
         }
     }
 
