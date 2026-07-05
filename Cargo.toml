@@ -23,26 +23,26 @@ members = [
 ]
 
 [workspace.package]
-version = "0.20.0"
+version = "1.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/matthart1983/ticktape"
 rust-version = "1.85"
 
 [workspace.dependencies]
-ticktape-core = { path = "crates/ticktape-core" }
-ticktape-codec = { path = "crates/ticktape-codec" }
-ticktape-macros = { path = "crates/ticktape-macros" }
-ticktape-journal = { path = "crates/ticktape-journal" }
-ticktape-runtime = { path = "crates/ticktape-runtime" }
-ticktape-sim = { path = "crates/ticktape-sim" }
-ticktape-transport = { path = "crates/ticktape-transport" }
-ticktape-cluster = { path = "crates/ticktape-cluster" }
-ticktape-server = { path = "crates/ticktape-server" }
-ticktape-gateway = { path = "crates/ticktape-gateway" }
-ticktape-sbe = { path = "crates/ticktape-sbe" }
-ticktape-raft = { path = "crates/ticktape-raft" }
-ticktape = { path = "crates/ticktape" }
+ticktape-core = { path = "crates/ticktape-core", version = "1.0.0" }
+ticktape-codec = { path = "crates/ticktape-codec", version = "1.0.0" }
+ticktape-macros = { path = "crates/ticktape-macros", version = "1.0.0" }
+ticktape-journal = { path = "crates/ticktape-journal", version = "1.0.0" }
+ticktape-runtime = { path = "crates/ticktape-runtime", version = "1.0.0" }
+ticktape-sim = { path = "crates/ticktape-sim", version = "1.0.0" }
+ticktape-transport = { path = "crates/ticktape-transport", version = "1.0.0" }
+ticktape-cluster = { path = "crates/ticktape-cluster", version = "1.0.0" }
+ticktape-server = { path = "crates/ticktape-server", version = "1.0.0" }
+ticktape-gateway = { path = "crates/ticktape-gateway", version = "1.0.0" }
+ticktape-sbe = { path = "crates/ticktape-sbe", version = "1.0.0" }
+ticktape-raft = { path = "crates/ticktape-raft", version = "1.0.0" }
+ticktape = { path = "crates/ticktape", version = "1.0.0" }
 
 [profile.release]
 lto = "thin"

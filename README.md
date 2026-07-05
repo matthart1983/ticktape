@@ -253,6 +253,14 @@ cargo run --release -p ticktape-sim --bin vopr -- --seed 42     # reproduce one 
 
 CI runs 2000 fresh seeds on every push.
 
+## Documentation
+
+- **[docs/GUIDE.md](docs/GUIDE.md)** — a guided tour: the one idea, the
+  `Service` contract, your first service, durability tiers, recovery, the
+  simulator, and going multi-node. Read this to *learn* Ticktape.
+- **[WIRE.md](WIRE.md)** — the byte-level wire-format spec (frame, segment,
+  snapshot, packet, codec), for writing a non-Rust node.
+
 ## What's in the box
 
 | Crate | What it is |
