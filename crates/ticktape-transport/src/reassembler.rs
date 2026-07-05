@@ -33,6 +33,12 @@ pub struct Reassembler {
     /// Highest seq known to exist (from frames seen and heartbeats):
     /// `announced_next - 1` frames exist upstream.
     announced_next: u64,
+    /// Monotonic count of packets ingested (data *and* heartbeats). A
+    /// follower's failure detector watches this: an idle-but-alive leader
+    /// still sends heartbeats, so this advances even when `announced_next`
+    /// does not — that is exactly what tells "leader quiet" from "leader
+    /// gone".
+    packets_seen: u64,
 }
 
 impl Reassembler {
@@ -45,7 +51,14 @@ impl Reassembler {
             next: start,
             pending: BTreeMap::new(),
             announced_next: start,
+            packets_seen: 0,
         }
+    }
+
+    /// Monotonic count of ingested packets (data + heartbeats) — the
+    /// liveness signal a follower's failure detector samples.
+    pub fn packets_seen(&self) -> u64 {
+        self.packets_seen
     }
 
     /// The session this stream locked onto, once known.
@@ -76,6 +89,7 @@ impl Reassembler {
             }
             Some(_) => {}
         }
+        self.packets_seen += 1;
         match packet {
             Packet::Heartbeat { next_seq, .. } => {
                 self.announced_next = self.announced_next.max(next_seq.0);

@@ -34,10 +34,10 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ticktape_cluster::{run_election, AcceptorServer, ElectionOutcome, PersistentAcceptor};
-use ticktape_core::{encode_to_vec, Frame, Seq, Service};
+use ticktape_core::{decode_all, encode_to_vec, Frame, FrameKind, Seq, Service};
 use ticktape_journal::{FsyncPolicy, Journal, JournalConfig, RealStorage};
 use ticktape_runtime::{Node, NodeConfig};
 use ticktape_transport::{
@@ -133,6 +133,55 @@ struct FollowerMode<S: Service> {
     replica: Replica<S>,
     /// Frames the follower has journaled; its acceptor's high-water.
     applied: Seq,
+    /// Automatic failure detector (Stage B).
+    detector: FailureDetector,
+}
+
+/// A follower's leader-liveness detector: the leader is presumed alive as
+/// long as *some* packet (a data frame or an idle heartbeat) keeps arriving.
+/// If none arrives within `timeout`, the leader is presumed dead and the
+/// follower stands for election. Real wall-clock — this is a liveness
+/// policy, not a safety property (the epoch election guarantees safety no
+/// matter how twitchy the detector is), so it lives outside the
+/// deterministic simulator.
+struct FailureDetector {
+    /// Packet count last time we saw progress, and when that was.
+    last_packets_seen: u64,
+    last_progress: Instant,
+    /// This node's effective timeout (`base + idx * stagger`), so the
+    /// lowest-indexed survivor stands first.
+    timeout: Duration,
+}
+
+impl FailureDetector {
+    fn new(timeout: Duration, packets_seen: u64) -> Self {
+        FailureDetector {
+            last_packets_seen: packets_seen,
+            last_progress: Instant::now(),
+            timeout,
+        }
+    }
+
+    /// Feed the latest packet count; refresh the liveness deadline if it
+    /// advanced (the leader spoke).
+    fn observe(&mut self, packets_seen: u64) {
+        if packets_seen > self.last_packets_seen {
+            self.last_packets_seen = packets_seen;
+            self.last_progress = Instant::now();
+        }
+    }
+
+    /// True once the leader has been silent past this node's timeout.
+    fn suspects(&self) -> bool {
+        self.last_progress.elapsed() >= self.timeout
+    }
+
+    /// Restart the clock — after a repoint to a new leader, or a promotion
+    /// attempt, so we give the new target a full timeout window.
+    fn reset(&mut self, packets_seen: u64) {
+        self.last_packets_seen = packets_seen;
+        self.last_progress = Instant::now();
+    }
 }
 
 enum Mode<S: Service> {
@@ -222,11 +271,14 @@ where
                 retransmitter: None,
             },
         );
+        let timeout = config.failover_timeout + config.failover_stagger * idx as u32;
+        let detector = FailureDetector::new(timeout, receiver.packets_seen());
         Ok(FollowerMode {
             receiver,
             journal: recovered.journal,
             replica,
             applied,
+            detector,
         })
     }
 
@@ -356,6 +408,15 @@ where
                         let _ = f.replica.apply(&frame);
                         f.applied = frame.seq;
                         self.acceptor.lock().unwrap().observe_seq(frame.seq);
+                        // Adopt the epoch a fence frame carries, so a
+                        // subsequent failover targets a fresh epoch rather
+                        // than re-bidding one already won (disjoint field
+                        // borrow from `f`).
+                        if frame.kind == FrameKind::EpochChange {
+                            if let Ok((epoch, _next)) = decode_all::<(u64, u64)>(&frame.payload) {
+                                self.epoch = self.epoch.max(epoch);
+                            }
+                        }
                         applied += 1;
                     }
                 }
@@ -366,13 +427,91 @@ where
                 }
             }
         }
+        // Feed the failure detector: any packet (frame or idle heartbeat)
+        // received this pump counts as the leader being alive.
+        f.detector.observe(f.receiver.packets_seen());
         Ok(applied)
     }
 
-    /// Which peer index this follower should currently gap-fill from. In
-    /// Stage A the operator promotes explicitly, so the "current leader" is
-    /// tracked via `retx_addr` set at promotion; absent that we fall back to
-    /// peer 0. (Stage B's failure detector will maintain this properly.)
+    /// **Leader liveness.** Emit a heartbeat to every follower feed so an
+    /// idle leader (no inputs to sequence) is not mistaken for a dead one.
+    /// The driver calls this every `heartbeat_interval`; no-op for a
+    /// follower.
+    pub fn heartbeat(&mut self) -> Result<(), ServerError> {
+        let Mode::Leader(leader) = &mut self.mode else {
+            return Ok(());
+        };
+        for (i, peer) in self.config.peers.iter().enumerate() {
+            if i == self.idx {
+                continue;
+            }
+            leader.publisher.heartbeat_to(peer.feed)?;
+        }
+        Ok(())
+    }
+
+    /// Whether this follower currently suspects the leader has failed (its
+    /// detector has seen no liveness within its timeout). `false` for a
+    /// leader. This is the trigger [`Server::maybe_failover`] acts on.
+    pub fn leader_suspected(&self) -> bool {
+        match &self.mode {
+            Mode::Follower(f) => f.detector.suspects(),
+            _ => false,
+        }
+    }
+
+    /// **Automatic failover (Stage B).** If this follower suspects the leader
+    /// is dead, stand for election with no operator action. On winning,
+    /// become the leader (identical to [`Server::promote`]). On losing —
+    /// another survivor won the epoch — repoint gap-fill at the presumptive
+    /// new leader and resume following, so the deployment re-converges on
+    /// its own. Returns the role this server holds afterwards.
+    ///
+    /// The driver calls this each loop; the epoch election makes concurrent
+    /// attempts safe (at most one leader per epoch), and the per-index
+    /// stagger makes the lowest-indexed survivor the usual winner.
+    pub fn maybe_failover(&mut self) -> Result<Role, ServerError> {
+        if !self.leader_suspected() {
+            return Ok(self.role());
+        }
+        match self.promote() {
+            Ok(()) => Ok(Role::Leader),
+            Err(ServerError::ElectionLost { .. }) => {
+                // Someone else is (or is becoming) leader. Point at the most
+                // likely winner — the lowest-indexed peer that isn't us and
+                // isn't the leader we just gave up on — and give it a fresh
+                // timeout window. If we guessed a dead node, the detector
+                // fires again next round and we rotate on.
+                self.repoint_after_failed_promotion();
+                Ok(Role::Follower)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// After losing a failover election, choose a new gap-fill target and
+    /// reset the detector. Rotates through peers so repeated failures walk
+    /// past dead nodes until frames flow from the real new leader.
+    fn repoint_after_failed_promotion(&mut self) {
+        let n = self.config.peers.len();
+        let dead = self.config.leader_hint;
+        // Next candidate after the one we suspected, skipping ourselves.
+        let mut cand = (dead + 1) % n;
+        while cand == self.idx {
+            cand = (cand + 1) % n;
+        }
+        self.config.leader_hint = cand;
+        if let Mode::Follower(f) = &mut self.mode {
+            f.receiver
+                .set_retransmitter(Some(self.config.peers[cand].retx));
+            f.detector.reset(f.receiver.packets_seen());
+        }
+    }
+
+    /// Which peer index this follower currently gap-fills from. Maintained
+    /// automatically by the Stage-B failure detector (`maybe_failover`
+    /// re-points it on a lost election); an operator may still override it
+    /// via `set_leader_hint`.
     fn current_leader_hint(&self) -> usize {
         self.config.leader_hint
     }

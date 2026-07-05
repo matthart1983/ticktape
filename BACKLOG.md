@@ -28,7 +28,7 @@ and the feed example ran to seq 1,400 on one segment + two snapshots with a
 late joiner backfilling from disk. **A node now runs 24×7/365 with no
 restart or day-roll.**
 
-### ◑ 1. No single point of failure — Stage A DONE (v0.10.0), Stage B open
+### ✅ 1. No single point of failure — DONE (Stage A v0.10.0, Stage B v0.13.0)
 "The sequencer needs several running at the same time; the journal also
 needs several running, replicated, so that all the single points of
 failure are removed." In this architecture a *replicated journal* is not
@@ -89,11 +89,27 @@ deferred-ack mode (P1.3, done) to a live follower→leader ack channel so
 "no committed loss" is enforced by the runtime end-to-end, not just held
 by caught-up replicas.
 
-**Stage B — open.** A failure detector (missed-heartbeat count over the
-existing transport heartbeats) that maintains `leader_hint` and triggers
-promotion automatically. **Done means:** `kill -9` the leader; a standby
-promotes within the heartbeat timeout with no operator action; the
-cluster sim's invariants hold on the real deployment's journals.
+**✅ Stage B — DONE (v0.13.0).** A follower-side failure detector
+(`FailureDetector`) samples the transport's new `packets_seen` liveness
+counter each `pump`: an idle leader still heartbeats, so the counter
+advances even with no new frames, distinguishing "leader quiet" from
+"leader gone". When it sees no liveness within `failover_timeout + idx *
+failover_stagger` (staggered so the lowest-indexed survivor stands first),
+`Server::maybe_failover()` stands for election with no operator action; on
+winning it becomes leader, on losing it re-points gap-fill at the
+presumptive new leader and resumes following — the deployment re-converges
+on its own. Followers adopt the epoch carried by `EpochChange` fence frames
+so a *second* failover targets a fresh epoch. `Server::heartbeat()` fans
+liveness out to every follower feed.
+**Verified** (`ticktape-server/tests/auto_failover.rs`, real loopback): a
+3-node deployment whose main loop is just `pump` + `heartbeat` +
+`maybe_failover` — never `promote()` or `set_leader_hint()` — loses its
+leader to a `drop`, promotes the lowest-indexed survivor automatically with
+the exact pre-failover state (no committed loss, conservation invariant
+holds) and a bumped epoch, and the other survivor re-points and re-converges
+on its own; a negative test proves an idle-but-heartbeating leader never
+triggers a false failover. Safety of *what* promotion does remains covered
+by the deterministic cluster sim; this stage adds the real-time *trigger*.
 
 ## P1 — correctness traps and product machinery
 

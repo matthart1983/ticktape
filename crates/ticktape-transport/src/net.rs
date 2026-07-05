@@ -110,6 +110,18 @@ impl Publisher {
         self.send(&packet.encode())
     }
 
+    /// Advertise liveness + high-water to a single explicit destination —
+    /// the heartbeat counterpart of [`Publisher::publish_to`], for fan-out
+    /// to N follower feeds.
+    pub fn heartbeat_to(&mut self, dest: SocketAddr) -> Result<(), TransportError> {
+        let packet = Packet::Heartbeat {
+            session: self.config.session,
+            next_seq: Seq(self.next_seq),
+        };
+        self.socket.send_to(&packet.encode(), dest)?;
+        Ok(())
+    }
+
     fn send(&self, bytes: &[u8]) -> Result<(), TransportError> {
         self.socket.send_to(bytes, self.config.dest_a)?;
         if let Some(dest_b) = self.config.dest_b {
@@ -211,6 +223,14 @@ impl<Src: PacketSource> Receiver<Src> {
     /// the numerator for a follower's replication lag.
     pub fn announced_high_water(&self) -> Seq {
         self.reassembler.announced_high_water()
+    }
+
+    /// Monotonic count of packets received from upstream (data + heartbeats).
+    /// A follower's failure detector samples this each poll: if it has not
+    /// advanced within the timeout, the leader is presumed dead. Heartbeats
+    /// count, so an idle leader is not mistaken for a failed one.
+    pub fn packets_seen(&self) -> u64 {
+        self.reassembler.packets_seen()
     }
 
     fn fill_gap(&mut self, from: Seq, count: u64) -> Result<(), TransportError> {
